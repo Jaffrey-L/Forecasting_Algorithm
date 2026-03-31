@@ -12,6 +12,7 @@ from src.database.repositories import get_database_engine, query_forecast_result
 
 TOKEN_SPLIT_RE = re.compile(r"[\s,;|\r\n\t]+")
 VALID_MODES = {"fast", "smart", "full"}
+DEFAULT_SCOPE_MIN_WEEKS = 108
 
 
 def parse_manual_spus(raw: str) -> Dict[str, Any]:
@@ -163,7 +164,20 @@ class ForecastRuntimeManager:
         if df.empty:
             return []
         df.columns = [str(col).lower() for col in df.columns]
-        return sorted(df["spu"].astype(str).unique().tolist())
+        if "date" not in df.columns or "spu" not in df.columns:
+            return sorted(df["spu"].astype(str).unique().tolist())
+
+        # The default "all" scope is restricted to SPUs with at least 108
+        # weekly observations so Linux scheduled runs follow the same business rule.
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        weekly_counts = (
+            df.dropna(subset=["date"])
+            .assign(spu=df["spu"].astype(str))
+            .groupby("spu")["date"]
+            .nunique()
+        )
+        eligible_spus = weekly_counts[weekly_counts >= DEFAULT_SCOPE_MIN_WEEKS].index.tolist()
+        return sorted(eligible_spus)
 
     def _execute_run(self, run_id: str, stop_event: threading.Event) -> None:
         from main import get_data_from_db, process_single_spu

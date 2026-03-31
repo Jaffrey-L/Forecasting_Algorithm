@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.api.platform_store import PlatformStore
-from src.api.runtime import ForecastRuntimeManager, VALID_MODES
+from src.api.runtime import DEFAULT_SCOPE_MIN_WEEKS, ForecastRuntimeManager, VALID_MODES
 
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -123,6 +123,7 @@ def _legacy_status_payload(run: Optional[dict[str, Any]]):
             "trigger_source": None,
             "error": None,
             "error_message": None,
+            "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
         }
     error_message = run.get("error_message")
     return {
@@ -137,6 +138,7 @@ def _legacy_status_payload(run: Optional[dict[str, Any]]):
         "trigger_source": run.get("trigger_source"),
         "error": error_message,
         "error_message": error_message,
+        "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
     }
 
 
