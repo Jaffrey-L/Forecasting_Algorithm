@@ -124,8 +124,27 @@ def _legacy_status_payload(run: Optional[dict[str, Any]]):
             "error": None,
             "error_message": None,
             "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+            "scope_total_spus": 0,
+            "scope_eligible_spus": 0,
+            "scope_excluded_spus": 0,
         }
     error_message = run.get("error_message")
+    summary = run.get("summary", {}) or {}
+    selected_spus = run.get("selected_spus", []) or []
+    if run.get("selection_type") == "all" and "scope_total_spus" not in summary:
+        try:
+            resolved = manager.resolve_selection("all", {})
+            summary = {
+                **summary,
+                "scope_total_spus": resolved.get("scope_total_spus", len(selected_spus)),
+                "scope_eligible_spus": resolved.get("scope_eligible_spus", len(selected_spus)),
+                "scope_excluded_spus": resolved.get("scope_excluded_spus", 0),
+                "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+            }
+        except Exception:
+            pass
+    scope_eligible_spus = summary.get("scope_eligible_spus", len(selected_spus))
+    scope_total_spus = summary.get("scope_total_spus", scope_eligible_spus)
     return {
         "run_id": run["id"],
         "status": run["status"],
@@ -138,7 +157,13 @@ def _legacy_status_payload(run: Optional[dict[str, Any]]):
         "trigger_source": run.get("trigger_source"),
         "error": error_message,
         "error_message": error_message,
-        "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+        "scope_min_weeks": summary.get("scope_min_weeks", DEFAULT_SCOPE_MIN_WEEKS),
+        "scope_total_spus": scope_total_spus,
+        "scope_eligible_spus": scope_eligible_spus,
+        "scope_excluded_spus": summary.get(
+            "scope_excluded_spus",
+            max(scope_total_spus - scope_eligible_spus, 0),
+        ),
     }
 
 

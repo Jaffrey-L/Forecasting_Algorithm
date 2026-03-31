@@ -92,7 +92,7 @@ class ForecastRuntimeManager:
                 "preview": parsed["spus"][:50],
             }
         if selection_type == "all":
-            all_spus = self._load_all_spus()
+            all_spus, total_spus = self._load_all_spus_with_scope()
             return {
                 "selection_type": "all",
                 "selection_payload": {},
@@ -100,6 +100,9 @@ class ForecastRuntimeManager:
                 "count": len(all_spus),
                 "invalid_items": [],
                 "preview": all_spus[:50],
+                "scope_total_spus": total_spus,
+                "scope_eligible_spus": len(all_spus),
+                "scope_excluded_spus": max(total_spus - len(all_spus), 0),
             }
         raise ValueError(f"Unsupported selection type: {selection_type}")
 
@@ -121,6 +124,15 @@ class ForecastRuntimeManager:
             selection_type=resolved["selection_type"],
             selection_payload=resolved["selection_payload"],
             selected_spus=resolved["selected_spus"],
+        )
+        self.store.update_run(
+            run["id"],
+            summary={
+                "scope_total_spus": resolved.get("scope_total_spus", len(resolved["selected_spus"])),
+                "scope_eligible_spus": resolved.get("scope_eligible_spus", len(resolved["selected_spus"])),
+                "scope_excluded_spus": resolved.get("scope_excluded_spus", 0),
+                "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+            },
         )
         stop_event = threading.Event()
         self._runs[run["id"]] = stop_event
@@ -158,18 +170,24 @@ class ForecastRuntimeManager:
         self.store.add_log(run_id, level, message)
 
     def _load_all_spus(self) -> List[str]:
+        eligible_spus, _total_spus = self._load_all_spus_with_scope()
+        return eligible_spus
+
+    def _load_all_spus_with_scope(self) -> tuple[List[str], int]:
         from main import get_data_from_db
 
         df = get_data_from_db(self.db_url)
         if df.empty:
-            return []
+            return [], 0
         df.columns = [str(col).lower() for col in df.columns]
         if "date" not in df.columns or "spu" not in df.columns:
-            return sorted(df["spu"].astype(str).unique().tolist())
+            all_spus = sorted(df["spu"].astype(str).unique().tolist())
+            return all_spus, len(all_spus)
 
         # The default "all" scope is restricted to SPUs with at least 108
         # weekly observations so Linux scheduled runs follow the same business rule.
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        all_spus = sorted(df["spu"].astype(str).unique().tolist())
         weekly_counts = (
             df.dropna(subset=["date"])
             .assign(spu=df["spu"].astype(str))
@@ -177,7 +195,7 @@ class ForecastRuntimeManager:
             .nunique()
         )
         eligible_spus = weekly_counts[weekly_counts >= DEFAULT_SCOPE_MIN_WEEKS].index.tolist()
-        return sorted(eligible_spus)
+        return sorted(eligible_spus), len(all_spus)
 
     def _execute_run(self, run_id: str, stop_event: threading.Event) -> None:
         from main import get_data_from_db, process_single_spu
@@ -258,6 +276,10 @@ class ForecastRuntimeManager:
                 "successful_spus": successful,
                 "failed_spus": len(failures),
                 "failed_details": failures[:20],
+                "scope_total_spus": run.get("summary", {}).get("scope_total_spus", total_spus),
+                "scope_eligible_spus": run.get("summary", {}).get("scope_eligible_spus", total_spus),
+                "scope_excluded_spus": run.get("summary", {}).get("scope_excluded_spus", 0),
+                "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
             }
             if all_results:
                 final = pd.concat(all_results, ignore_index=True)
