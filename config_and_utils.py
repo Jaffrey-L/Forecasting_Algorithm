@@ -410,7 +410,7 @@ class SearchConfig:
         'catboost': {'iterations': [100], 'depth': [6], 'learning_rate': [0.1]},
         'dl_residual': {'look_back': [4], 'neurons': [32], 'epochs': 15, 'learning_rate': [0.01], 'dropout': [0.1]},
         'ensemble': {'methods': ['weighted']}, 'use_auto_arima': False, 'arima_order': (1, 1, 1),
-        'arima_seasonal_order': (0, 1, 1, 52), 'model_timeout': 60, 'arima_timeout': 120, 'dl_timeout': 120,
+        'arima_seasonal_order': (0, 1, 1, 52), 'model_timeout': 60, 'arima_timeout': 45, 'dl_timeout': 120,
         'enable_tcn': False, 'enable_nbeats': False, 'max_combinations': 8
     }
     SMART = {
@@ -800,88 +800,75 @@ def plot_best_spu_style(profile, train_data, test_data, all_results, future_pred
         print(f"   ⚠️ 高级图表失败: {str(e)}")
 
 
-def calculate_dynamic_shares(df_spu_idx, spu, spu_sales_weekly, future_dates):
-    """
-    Calculate future SKU shares using trend-based extrapolation with damping.
-    
-    Logic:
-    1. Calculate historical shares (SKU Sales / SPU Total).
-    2. For each SKU, fit a trend line (linear regression) on the recent 8-12 weeks.
-    3. Project future shares using the trend, but apply a damping factor (phi=0.9) to avoid extreme extrapolation.
-    4. Normalize shares at each time step to ensure sum(shares) = 1.
-    """
-    sku_sales = df_spu_idx.groupby([pd.Grouper(freq='W'), 'sku'])['sales'].sum().unstack(fill_value=0)
-    # Ensure index alignment with SPU total
-    sku_sales = sku_sales.reindex(spu_sales_weekly.index, fill_value=0)
+def _calculate_group_dynamic_shares(df_spu_idx, group_col, spu_sales_weekly, future_dates):
+    grouped_sales = df_spu_idx.groupby([pd.Grouper(freq='W'), group_col])['sales'].sum().unstack(fill_value=0)
+    grouped_sales = grouped_sales.reindex(spu_sales_weekly.index, fill_value=0)
 
-    spu_total = sku_sales.sum(axis=1)
-    # Calculate historical shares, handle 0 total
-    hist_shares = sku_sales.div(spu_total.replace(0, np.nan), axis=0).ffill().fillna(0)
+    total = grouped_sales.sum(axis=1)
+    hist_shares = grouped_sales.div(total.replace(0, np.nan), axis=0).ffill().fillna(0)
 
     future_shares = {}
-    
-    # Trend Analysis Parameters
-    LOOKBACK_WEEKS = 12  # Look back 12 weeks to determine trend
-    MIN_WEEKS = 4        # Minimum weeks required for trend calculation
-    DAMPING_FACTOR = 0.9 # Damping factor for trend projection (0.9 means trend decays by 10% each week)
+    LOOKBACK_WEEKS = 12
+    MIN_WEEKS = 4
+    DAMPING_FACTOR = 0.9
 
     for sku in hist_shares.columns:
         series = hist_shares[sku]
         n = len(series)
-        
+
         if n >= MIN_WEEKS:
-            # Use recent data for trend calculation
             window_size = min(n, LOOKBACK_WEEKS)
             recent_data = series.iloc[-window_size:]
-            
-            # Current Level (Smoothed)
-            # Use EWM to get a robust current level estimate
             current_level = recent_data.ewm(span=window_size, adjust=False).mean().iloc[-1]
-            
-            # Trend Slope Calculation (Linear Regression on recent window)
+
             try:
-                # X = [0, 1, 2, ...]
                 x = np.arange(window_size)
                 y = recent_data.values
-                # Fit y = mx + c
                 slope, intercept = np.polyfit(x, y, 1)
             except:
                 slope = 0
-            
-            # Projection
+
             future_vals = []
             curr_val = current_level
             curr_slope = slope
-            
+
             for _ in range(len(future_dates)):
-                # Apply trend
                 curr_val += curr_slope
-                
-                # Apply damping to slope (Trend naturally decays over time)
                 curr_slope *= DAMPING_FACTOR
-                
-                # Clip to valid range [0.001, 1.0] (avoid absolute 0 unless explicitly 0)
-                # Allow small epsilon to prevent division by zero later if all become 0
                 curr_val = max(0.0001, min(1.0, curr_val))
-                
                 future_vals.append(curr_val)
-                
             future_shares[sku] = future_vals
         else:
-            # Fallback for very short history: Use simple mean
             mean_val = series.mean() if len(series) > 0 else 0
             future_shares[sku] = [mean_val] * len(future_dates)
 
-    # Convert to DataFrame
     future_df = pd.DataFrame(future_shares, index=future_dates)
-    
-    # Normalization: Ensure sum(shares) = 1 for each week
     row_sums = future_df.sum(axis=1)
-    # Avoid division by zero
     future_df = future_df.div(row_sums.replace(0, 1), axis=0).fillna(0)
-
-    # Convert to JSON format for DB storage
-    # Also return the dataframe for plotting/analysis if needed
     json_list = future_df.apply(lambda row: json.dumps(row.to_dict(), ensure_ascii=False), axis=1).values
-    
     return json_list, future_df
+
+
+def calculate_dynamic_shares(df_spu_idx, spu, spu_sales_weekly, future_dates):
+    """
+    SKU 份额预测（保留原函数签名，兼容现有调用）。
+    """
+    return _calculate_group_dynamic_shares(df_spu_idx, "sku", spu_sales_weekly, future_dates)
+
+
+def calculate_principal_dynamic_shares(df_spu_idx, spu_sales_weekly, future_dates):
+    """
+    负责人（principal_names）权重预测。
+    """
+    if "principal_names" not in df_spu_idx.columns:
+        df_spu_idx = df_spu_idx.copy()
+        df_spu_idx["principal_names"] = "UNKNOWN"
+    else:
+        df_spu_idx = df_spu_idx.copy()
+        df_spu_idx["principal_names"] = (
+            df_spu_idx["principal_names"]
+            .astype(str)
+            .str.strip()
+            .replace({"": "UNKNOWN", "nan": "UNKNOWN", "None": "UNKNOWN"})
+        )
+    return _calculate_group_dynamic_shares(df_spu_idx, "principal_names", spu_sales_weekly, future_dates)

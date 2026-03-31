@@ -1,176 +1,396 @@
 import os
-import time
-import json
-import subprocess
-import threading
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from contextlib import asynccontextmanager
+from typing import Any, Optional
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-import uvicorn
+from pydantic import BaseModel, Field
 
-# 获取项目根目录
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-static_dir = project_root
+from src.api.platform_store import PlatformStore
+from src.api.runtime import ForecastRuntimeManager, VALID_MODES
 
-app = FastAPI(title="预测分析API", description="提供预测分析功能的API服务")
 
-# 配置CORS
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+frontend_root = os.path.join(project_root, "frontend")
+static_root = os.path.join(project_root, "static")
+dashboard_v2_path = os.path.join(project_root, "forecast_dashboard_v2.html")
+platform_db = os.path.join(project_root, "data", "platform_state.db")
+db_url = os.getenv(
+    "SALES_FORECAST_DB_URL",
+    "postgresql+psycopg2://postgres:vayiERty123@192.168.1.226:5432/finedatalink",
+)
+
+store = PlatformStore(platform_db)
+manager = ForecastRuntimeManager(store=store, db_url=db_url)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    manager.start_scheduler()
+    try:
+        yield
+    finally:
+        manager.stop_scheduler()
+
+
+app = FastAPI(
+    title="Forecast Platform API",
+    description="Configurable forecast execution platform",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 在生产环境中应该设置具体的前端地址
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/static", StaticFiles(directory=static_root), name="static")
 
-# 配置静态文件服务
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# 全局变量用于跟踪分析状态
-analysis_status = {
-    "status": "idle",  # idle, running, completed, failed
-    "progress": 0,
-    "processed_count": 0,
-    "total_count": 0,
-    "success_count": 0,
-    "error_message": None
-}
+class SelectionResolveRequest(BaseModel):
+    selection_type: str = Field(pattern="^(all|manual|sql)$")
+    manual_spus: str = ""
+    sql_query: str = ""
 
-# 日志存储
-analysis_logs = []
 
-# 分析进程
-analysis_process = None
+class JobCreateRequest(BaseModel):
+    mode: str = "smart"
+    selection_type: str = Field(pattern="^(all|manual|sql)$")
+    manual_spus: str = ""
+    sql_query: str = ""
+    config_id: Optional[str] = None
 
-# 根路径重定向到forecast_dashboard_v2.html
+
+class LegacyStartRequest(BaseModel):
+    mode: str = "smart"
+    selection_type: str = "all"
+    manual_spus: str = ""
+    sql_query: str = ""
+    config_id: Optional[str] = None
+
+
+class ConfigCreateRequest(BaseModel):
+    name: str
+    purpose: str = ""
+    mode: str = "smart"
+    selection_type: str = Field(pattern="^(all|manual|sql)$")
+    manual_spus: str = ""
+    sql_query: str = ""
+    is_active: bool = True
+
+
+class ScheduleUpsertRequest(BaseModel):
+    config_id: str
+    weekday: int = Field(ge=0, le=6)
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    timezone: str = "Asia/Shanghai"
+    enabled: bool = True
+
+
+def _selection_payload(request: Any):
+    return {
+        "manual_spus": getattr(request, "manual_spus", ""),
+        "sql_query": getattr(request, "sql_query", ""),
+    }
+
+
+def _preferred_run(run_id: Optional[str] = None):
+    if run_id:
+        return store.get_run(run_id)
+    runs = store.list_runs(limit=20)
+    for preferred_status in ("running", "queued", "stopping"):
+        for run in runs:
+            if run["status"] == preferred_status:
+                return run
+    return runs[0] if runs else None
+
+
+def _legacy_status_payload(run: Optional[dict[str, Any]]):
+    if not run:
+        return {
+            "run_id": None,
+            "status": "idle",
+            "progress": 0,
+            "processed_count": 0,
+            "total_count": 0,
+            "success_count": 0,
+            "current_spu": None,
+            "mode": "smart",
+            "trigger_source": None,
+            "error": None,
+            "error_message": None,
+        }
+    error_message = run.get("error_message")
+    return {
+        "run_id": run["id"],
+        "status": run["status"],
+        "progress": run["progress"],
+        "processed_count": run["processed_count"],
+        "total_count": run["total_count"],
+        "success_count": run["success_count"],
+        "current_spu": run["current_spu"],
+        "mode": run["mode"],
+        "trigger_source": run.get("trigger_source"),
+        "error": error_message,
+        "error_message": error_message,
+    }
+
+
+def _legacy_log_payloads(run_id: str, limit: int = 200):
+    rows = store.get_logs(run_id, limit=limit)
+    return [
+        {
+            "timestamp": row["created_at"],
+            "type": row["level"],
+            "message": row["message"],
+        }
+        for row in rows
+    ]
+
 @app.get("/")
 async def root():
-    html_file_path = os.path.join(project_root, "forecast_dashboard_v2.html")
-    print(f"[DEBUG] 正在加载HTML文件: {html_file_path}")
-    print(f"[DEBUG] 文件是否存在: {os.path.exists(html_file_path)}")
-    if not os.path.exists(html_file_path):
-        raise HTTPException(status_code=404, detail="前端文件不存在")
-    return FileResponse(html_file_path)
+    if not os.path.exists(dashboard_v2_path):
+        raise HTTPException(status_code=404, detail="forecast_dashboard_v2.html not found.")
+    return FileResponse(dashboard_v2_path)
 
-# 启动分析
-@app.post("/api/start-analysis")
-async def start_analysis(request: Request):
-    global analysis_status, analysis_logs, analysis_process
-    
-    # 解析请求体
-    data = await request.json()
-    mode = data.get("mode", "fast")
-    
-    # 检查是否已经在运行
-    if analysis_status["status"] == "running":
-        return {"error": "分析已经在运行中"}
-    
-    # 重置状态
-    analysis_status = {
-        "status": "running",
-        "progress": 0,
-        "processed_count": 0,
-        "total_count": 0,
-        "success_count": 0,
-        "error_message": None
-    }
-    analysis_logs = []
-    
-    # 启动分析进程
-    def run_analysis():
-        global analysis_status, analysis_logs, analysis_process
-        try:
-            # 构建命令
-            command = [
-                "python", "main.py",
-                f"--mode={mode}"
-            ]
-            
-            # 启动子进程
-            analysis_process = subprocess.Popen(
-                command,
-                cwd=project_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace'
-            )
-            
-            # 读取输出
-            for line in analysis_process.stdout:
-                if line.strip():
-                    analysis_logs.append(line.strip())
-                    # 尝试解析进度信息
-                    if "Progress:" in line:
-                        try:
-                            progress_str = line.split("Progress:")[1].strip().split("%")[0]
-                            analysis_status["progress"] = int(progress_str)
-                        except:
-                            pass
-                    if "Processed:" in line:
-                        try:
-                            processed_str = line.split("Processed:")[1].strip().split("/")[0]
-                            total_str = line.split("/")[1].strip()
-                            analysis_status["processed_count"] = int(processed_str)
-                            analysis_status["total_count"] = int(total_str)
-                        except:
-                            pass
-                    if "Success:" in line:
-                        try:
-                            success_str = line.split("Success:")[1].strip()
-                            analysis_status["success_count"] = int(success_str)
-                        except:
-                            pass
-            
-            # 等待进程完成
-            analysis_process.wait()
-            
-            if analysis_process.returncode == 0:
-                analysis_status["status"] = "completed"
-                analysis_status["progress"] = 100
-            else:
-                analysis_status["status"] = "failed"
-                analysis_status["error_message"] = "分析执行失败"
-                
-        except Exception as e:
-            analysis_status["status"] = "failed"
-            analysis_status["error_message"] = str(e)
-            analysis_logs.append(f"错误: {str(e)}")
-    
-    # 启动线程执行分析
-    threading.Thread(target=run_analysis, daemon=True).start()
-    
-    return {"message": "分析已启动", "mode": mode}
 
-# 停止分析
-@app.post("/api/stop-analysis")
-async def stop_analysis():
-    global analysis_status, analysis_process
-    
-    if analysis_process and analysis_process.poll() is None:
-        analysis_process.terminate()
-        analysis_status["status"] = "idle"
-        analysis_logs.append("用户手动停止分析")
-        return {"message": "分析已停止"}
-    else:
-        return {"message": "没有正在运行的分析"}
+@app.get("/control-platform")
+async def control_platform():
+    path = os.path.join(frontend_root, "index.html")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Frontend entry file not found.")
+    return FileResponse(path)
 
-# 获取分析状态
-@app.get("/api/analysis-status")
-async def get_analysis_status():
-    return analysis_status
+@app.get("/pm")
+async def project_management_dashboard():
+    path = os.path.join(frontend_root, "pm_dashboard.html")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Project management dashboard file not found.")
+    return FileResponse(path)
 
-# 获取分析日志
-@app.get("/api/analysis-logs")
-async def get_analysis_logs():
-    return {"logs": analysis_logs}
+@app.get("/design-review")
+async def design_review_page():
+    path = os.path.join(frontend_root, "design_review.html")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Design review page file not found.")
+    return FileResponse(path)
 
-# 健康检查
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.post("/api/spu-selection/resolve")
+async def resolve_spu_selection(request: SelectionResolveRequest):
+    try:
+        return manager.resolve_selection(request.selection_type, _selection_payload(request))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/forecast-jobs")
+async def create_forecast_job(request: JobCreateRequest):
+    if request.mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail="mode must be one of fast, smart, full")
+    try:
+        run = manager.create_run(
+            mode=request.mode,
+            selection_type=request.selection_type,
+            selection_payload=_selection_payload(request),
+            config_id=request.config_id,
+        )
+        return {"run_id": run["id"], "run": run}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/forecast-jobs")
+async def list_forecast_jobs(limit: int = 20):
+    return store.list_runs(limit=limit)
+
+
+@app.get("/api/forecast-jobs/{run_id}")
+async def get_forecast_job(run_id: str):
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return run
+
+
+@app.get("/api/forecast-jobs/{run_id}/spus")
+async def get_forecast_job_spus(run_id: str):
+    return store.get_run_spus(run_id)
+
+
+@app.get("/api/forecast-jobs/{run_id}/logs")
+async def get_forecast_job_logs(run_id: str, limit: int = 200):
+    return store.get_logs(run_id, limit=limit)
+
+
+@app.post("/api/forecast-jobs/{run_id}/stop")
+async def stop_forecast_job(run_id: str):
+    try:
+        return manager.stop_run(run_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/forecast-results")
+async def get_forecast_results(
+    run_id: Optional[str] = None,
+    config_id: Optional[str] = None,
+    spu: Optional[str] = None,
+    run_date: Optional[str] = None,
+    limit: int = 500,
+):
+    try:
+        return manager.get_results(
+            run_id=run_id,
+            config_id=config_id,
+            spu=spu,
+            run_date=run_date,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/forecast-configs")
+async def create_forecast_config(request: ConfigCreateRequest):
+    if request.mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail="mode must be one of fast, smart, full")
+    try:
+        resolved = manager.resolve_selection(request.selection_type, _selection_payload(request))
+        return store.create_config(
+            name=request.name,
+            purpose=request.purpose,
+            mode=request.mode,
+            selection_type=resolved["selection_type"],
+            selection_payload=resolved["selection_payload"],
+            is_active=request.is_active,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/forecast-configs")
+async def list_forecast_configs():
+    return store.list_configs()
+
+
+@app.post("/api/forecast-configs/{config_id}/run")
+async def run_forecast_config(config_id: str):
+    try:
+        run = manager.run_from_config(config_id)
+        return {"run_id": run["id"], "run": run}
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/forecast-schedules")
+async def upsert_forecast_schedule(request: ScheduleUpsertRequest):
+    config = store.get_config(request.config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found.")
+    return store.create_or_update_schedule(
+        config_id=request.config_id,
+        weekday=request.weekday,
+        hour=request.hour,
+        minute=request.minute,
+        timezone=request.timezone,
+        enabled=request.enabled,
+    )
+
+
+@app.get("/api/forecast-schedules")
+async def list_forecast_schedules():
+    return store.list_schedules()
+
+
+@app.post("/api/start-analysis")
+async def compatibility_start_analysis(request: LegacyStartRequest):
+    if request.mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail="mode must be one of fast, smart, full")
+    try:
+        if request.config_id:
+            run = manager.run_from_config(request.config_id, trigger_source="manual")
+        else:
+            run = manager.create_run(
+                mode=request.mode,
+                selection_type=request.selection_type or "all",
+                selection_payload=_selection_payload(request),
+                config_id=None,
+                trigger_source="manual",
+            )
+        return {
+            "message": "Analysis started.",
+            "status": "running",
+            "mode": run["mode"],
+            "run_id": run["id"],
+            "trigger_source": run.get("trigger_source"),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/stop-analysis")
+async def compatibility_stop_analysis(run_id: Optional[str] = None):
+    run = _preferred_run(run_id)
+    if not run:
+        raise HTTPException(status_code=400, detail="No analysis run found.")
+    try:
+        updated = manager.stop_run(run["id"])
+        return {
+            "message": "Analysis stop requested.",
+            "status": updated["status"],
+            "run_id": updated["id"],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/analysis-status")
+async def compatibility_analysis_status(run_id: Optional[str] = None):
+    return _legacy_status_payload(_preferred_run(run_id))
+
+
+@app.get("/api/analysis-logs")
+async def compatibility_analysis_logs(run_id: Optional[str] = None, limit: int = 200):
+    run = _preferred_run(run_id)
+    if not run:
+        return {"logs": []}
+    return {"run_id": run["id"], "logs": _legacy_log_payloads(run["id"], limit=limit)}
+
+
+@app.get("/api/completed-spus")
+async def compatibility_completed_spus(run_id: Optional[str] = None):
+    run = _preferred_run(run_id)
+    if not run:
+        return {"completed_spus": []}
+    spus = store.get_run_spus(run["id"])
+    completed = [
+        {
+            "spu": row["spu"],
+            "status": row["status"],
+            "message": row.get("message"),
+            "winner_algo": row.get("winner_algo"),
+            "validation_wmape": row.get("validation_wmape"),
+            "updated_at": row.get("updated_at"),
+        }
+        for row in spus
+        if row["status"] in {"completed", "failed"}
+    ]
+    return {"run_id": run["id"], "completed_spus": completed}
+
+
+@app.get("/api/runs/latest")
+async def latest_run():
+    run = _preferred_run()
+    if not run:
+        return {"run": None}
+    return {"run": run}

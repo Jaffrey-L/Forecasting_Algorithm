@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 import pmdarima as pm
 from prophet import Prophet
+from statsmodels.tsa.arima.model import ARIMA as SMARIMA
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import Ridge
 from tensorflow.keras.models import Sequential, Model
@@ -18,7 +20,7 @@ from lightgbm import LGBMRegressor
 import itertools
 import time
 import random
-from functools import partial
+from functools import partial, lru_cache
 from config_and_utils import *
 
 class FeatureEngineer:
@@ -302,6 +304,48 @@ def optimize_tree_model(model_type, train_data, test_data, feat_eng, mode='full'
 
 def optimize_prophet(train_data, test_data, mode='full', train_exog=None, test_exog=None):
     best = {'name': 'Prophet', 'wmape': float('inf'), 'forecast': None, 'params': None, 'error': None}
+    ok, reason = prophet_backend_available()
+    if not ok:
+        # 回退：当 Prophet backend 异常时，使用 ETS 生成可用预测，避免算法位失效
+        try:
+            y = train_data.astype(float)
+            test_values = test_data.values.flatten()
+            seasonal_periods = 52 if len(y) >= 104 else 13 if len(y) >= 26 else None
+            if seasonal_periods:
+                model = ExponentialSmoothing(
+                    y,
+                    trend="add",
+                    seasonal="add",
+                    seasonal_periods=seasonal_periods,
+                    initialization_method="estimated",
+                )
+            else:
+                model = ExponentialSmoothing(
+                    y,
+                    trend="add",
+                    seasonal=None,
+                    initialization_method="estimated",
+                )
+            fit = model.fit(optimized=True, use_brute=False)
+            pred = np.maximum(fit.forecast(len(test_values)).values, 0)
+            wmape = calculate_wmape(test_values, pred)
+            best.update(
+                {
+                    "name": "Prophet_Fallback",
+                    "wmape": wmape,
+                    "forecast": pred,
+                    "params": {
+                        "fallback": "ExponentialSmoothing",
+                        "seasonal_periods": seasonal_periods,
+                        "prophet_backend_error": str(reason)[:200],
+                    },
+                    "error": None,
+                }
+            )
+            return best
+        except Exception as e:
+            best["error"] = f"Prophet backend unavailable: {reason}; fallback failed: {str(e)[:80]}"
+            return best
     try:
         df_train = train_data.reset_index(); df_train.columns = ['ds', 'y']; df_train['ds'] = pd.to_datetime(df_train['ds'])
         exog_cols = []
@@ -345,15 +389,41 @@ def optimize_prophet(train_data, test_data, mode='full', train_exog=None, test_e
         best['error'] = str(e)
     return best
 
+@lru_cache(maxsize=1)
+def prophet_backend_available():
+    try:
+        _ = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            uncertainty_samples=0,
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
 def fit_shared_arima(train_data, mode='smart'):
     train_values = np.maximum(train_data.values.flatten(), 0)
     train_log, n = np.log1p(train_values), len(train_values)
+
+    # fast 模式快速路径：优先使用轻量 ARIMA，避免长时间超时
+    if mode == 'fast':
+        try:
+            sm_model = SMARIMA(train_log, order=(1, 1, 0))
+            sm_fit = sm_model.fit(method_kwargs={"maxiter": 50})
+            pred = np.expm1(sm_fit.predict(start=0, end=len(train_log) - 1))
+            if not np.any(np.isnan(pred)) and not np.any(np.isinf(pred)):
+                return sm_fit, pred, True, None
+        except Exception as e:
+            return None, None, False, f"fast_smarima: {str(e)[:120]}"
+
     m, use_seasonal = (4, False) if n < 52 else ((13, n>=26) if n < 104 else ((26, True) if n < 156 else (52, True)))
     
-    strategies = [('fixed_simple', (1,1,1), (0,1,1,m) if use_seasonal else (0,0,0,0)), ('fixed_minimal', (1,1,0), (0,0,0,0)), ('fixed_ar1', (1,0,0), (0,0,0,0))] if mode == 'fast' else [
+    strategies = [('fixed_minimal', (1,1,0), (0,0,0,0)), ('fixed_ar1', (1,0,0), (0,0,0,0)), ('fixed_simple', (1,1,1), (0,0,0,0))] if mode == 'fast' else [
         ('seasonal_simple', (1,1,1), (0,1,1,m) if use_seasonal else (0,0,0,0)), ('auto_limited', None, None),
         ('seasonal_minimal', (1,1,0), (0,1,0,m) if use_seasonal else (0,0,0,0)), ('nonseasonal', (1,1,1), (0,0,0,0)), ('minimal', (0,1,1), (0,0,0,0))]
     
+    last_error = None
     for name, order, s_order in strategies:
         try:
             if name == 'auto_limited':
@@ -364,8 +434,10 @@ def fit_shared_arima(train_data, mode='smart'):
             pred = np.expm1(am.predict_in_sample())
             if np.any(np.isnan(pred)) or np.any(np.isinf(pred)) or np.mean(pred) < 0 or (np.mean(train_values) > 0 and np.mean(pred) > np.mean(train_values)*10): continue
             return am, pred, True
-        except: continue
-    return None, None, False
+        except Exception as e:
+            last_error = f"{name}: {str(e)[:120]}"
+            continue
+    return None, None, False, last_error
 
 def build_tcn_model(input_shape, neurons):
     try:
@@ -391,8 +463,28 @@ def optimize_dl_with_arima(train_data, test_data, dl_type, arima_model, train_ar
     if not arima_model: return best
     try:
         test_values = test_data.values.flatten()
-        test_arima = np.expm1(arima_model.predict(n_periods=len(test_values)))
-        resids = np.nan_to_num((train_data.values.flatten() - train_arima).reshape(-1, 1), nan=0.0)
+        try:
+            arima_raw = arima_model.predict(n_periods=len(test_values))
+        except TypeError:
+            arima_raw = arima_model.forecast(steps=len(test_values))
+        test_arima = np.expm1(np.asarray(arima_raw).flatten())
+        if len(test_arima) != len(test_values):
+            if len(test_arima) > len(test_values):
+                test_arima = test_arima[: len(test_values)]
+            else:
+                pad_val = float(test_arima[-1]) if len(test_arima) > 0 else float(np.mean(train_data.values.flatten()))
+                test_arima = np.pad(test_arima, (0, len(test_values) - len(test_arima)), constant_values=pad_val)
+
+        train_values = train_data.values.flatten()
+        train_arima_arr = np.asarray(train_arima).flatten()
+        if len(train_arima_arr) != len(train_values):
+            if len(train_arima_arr) > len(train_values):
+                train_arima_arr = train_arima_arr[-len(train_values):]
+            else:
+                pad_val = float(train_arima_arr[0]) if len(train_arima_arr) > 0 else 0.0
+                train_arima_arr = np.pad(train_arima_arr, (len(train_values) - len(train_arima_arr), 0), constant_values=pad_val)
+
+        resids = np.nan_to_num((train_values - train_arima_arr).reshape(-1, 1), nan=0.0)
         scaler = MinMaxScaler((-1, 1)); res_scaled = scaler.fit_transform(resids)
         
         cfg = SearchConfig.get(mode)
@@ -425,11 +517,27 @@ def optimize_dl_with_arima(train_data, test_data, dl_type, arima_model, train_ar
                 for _ in range(len(test_values)):
                     p = m.predict(curr.reshape(1, lb, 1), verbose=0)[0, 0]
                     pred_resids.append(p); curr = np.append(curr[1:], p)
-                    
-                final_pred = np.maximum(test_arima + scaler.inverse_transform(np.array(pred_resids).reshape(-1, 1)).flatten(), 0)
-                wmape = calculate_wmape(test_values, final_pred)
+
+                resid_pred = scaler.inverse_transform(np.array(pred_resids).reshape(-1, 1)).flatten()
+                if len(resid_pred) != len(test_arima):
+                    min_len = min(len(resid_pred), len(test_arima))
+                    resid_pred = resid_pred[:min_len]
+                    test_arima_local = test_arima[:min_len]
+                    test_values_local = test_values[:min_len]
+                else:
+                    test_arima_local = test_arima
+                    test_values_local = test_values
+
+                final_pred = np.maximum(test_arima_local + resid_pred, 0)
+                wmape = calculate_wmape(test_values_local, final_pred)
                 if wmape < best['wmape']:
-                    best.update({'wmape': wmape, 'forecast': final_pred, 'params': {'look_back': lb, 'neurons': neu, 'epochs': dl_cfg.get('epochs', 20), 'learning_rate': lr, 'dropout': drop, 'arima_order': arima_model.order, 'arima_seasonal_order': arima_model.seasonal_order, 'dl_type': dl_type}, 'error': None})
+                    arima_order = getattr(arima_model, 'order', None)
+                    arima_seasonal_order = getattr(arima_model, 'seasonal_order', None)
+                    if arima_order is None and hasattr(arima_model, 'model') and hasattr(arima_model.model, 'order'):
+                        arima_order = arima_model.model.order
+                    if arima_seasonal_order is None and hasattr(arima_model, 'model') and hasattr(arima_model.model, 'seasonal_order'):
+                        arima_seasonal_order = arima_model.model.seasonal_order
+                    best.update({'wmape': wmape, 'forecast': final_pred, 'params': {'look_back': lb, 'neurons': neu, 'epochs': dl_cfg.get('epochs', 20), 'learning_rate': lr, 'dropout': drop, 'arima_order': arima_order, 'arima_seasonal_order': arima_seasonal_order, 'dl_type': dl_type}, 'error': None})
             except Exception as e:
                 if best['error'] is None:
                     best['error'] = f"{dl_type}: {str(e)[:50]}"
@@ -672,10 +780,10 @@ def run_all_models(train_data, test_data, mode='full', train_exog=None, test_exo
     
     def create_feat_eng(): return FeatureEngineer(lags=[1, 2, 4], rolling_windows=[4, 8])
     
-    print(f"\n   📦 Running models (mode={mode})...")
+    print(f"\n   [RUN] Running models (mode={mode})...")
     
     # Prophet: 单进程运行（Windows多进程兼容性问题）
-    print(f"      🔄 Prophet...", end=" ", flush=True)
+    print(f"      [MODEL] Prophet...", end=" ", flush=True)
     t0 = time.time()
     try:
         import os
@@ -703,7 +811,7 @@ def run_all_models(train_data, test_data, mode='full', train_exog=None, test_exo
         non_arima.append(('CatBoost', partial(optimize_tree_model, 'catboost', train_data, test_data, create_feat_eng(), mode, train_exog, test_exog)))
     
     for name, func in non_arima:
-        print(f"      🔄 {name}...", end=" ", flush=True)
+        print(f"      [MODEL] {name}...", end=" ", flush=True)
         t0 = time.time()
         res = run_with_timeout(func, cfg.get('model_timeout', 90))
         el = time.time() - t0
@@ -719,17 +827,35 @@ def run_all_models(train_data, test_data, mode='full', train_exog=None, test_exo
     
     am, t_arima = None, None
     if dl_models:
-        print(f"      🔄 Fitting ARIMA...", end=" ", flush=True)
+        print(f"      [MODEL] Fitting ARIMA...", end=" ", flush=True)
         t0 = time.time()
-        res = run_with_timeout(partial(fit_shared_arima, train_data, mode), cfg.get('arima_timeout', 40))
+        if mode == 'fast':
+            # fast 模式避免多进程启动开销，优先同步执行
+            res = fit_shared_arima(train_data, mode)
+        else:
+            res = run_with_timeout(partial(fit_shared_arima, train_data, mode), cfg.get('arima_timeout', 40))
         el = time.time() - t0
-        if res and res[2]: am, t_arima, _ = res; print(f"Done ({el:.1f}s, order={am.order})")
-        else: print(f"Failed ({el:.1f}s)")
+        if isinstance(res, (tuple, list)) and len(res) >= 3 and res[2]:
+            am, t_arima = res[0], res[1]
+            arima_order = getattr(am, "order", None)
+            if arima_order is None and hasattr(am, "model") and hasattr(am.model, "order"):
+                arima_order = am.model.order
+            print(f"Done ({el:.1f}s, order={arima_order})")
+        else:
+            arima_err = None
+            if isinstance(res, (tuple, list)) and len(res) >= 4:
+                arima_err = res[3]
+            elif isinstance(res, dict):
+                arima_err = res.get('error')
+            if arima_err:
+                print(f"Failed ({el:.1f}s): {str(arima_err)[:120]}")
+            else:
+                print(f"Failed ({el:.1f}s)")
         
     if am:
         for dt in dl_models:
             name = f"SARIMA+{dt.upper()}"
-            print(f"      🔄 {name}...", end=" ", flush=True)
+            print(f"      [MODEL] {name}...", end=" ", flush=True)
             t0 = time.time()
             res = run_with_timeout(partial(optimize_dl_with_arima, train_data, test_data, dt, am, t_arima, mode), cfg.get('dl_timeout', 50))
             el = time.time() - t0
@@ -740,7 +866,7 @@ def run_all_models(train_data, test_data, mode='full', train_exog=None, test_exo
                 print(f"Failed: {error_msg[:100]}")  # 显示更多错误信息
             
     if len(base_results) >= 2:
-        print(f"      🔄 Ensemble...", end=" ", flush=True)
+        print(f"      [MODEL] Ensemble...", end=" ", flush=True)
         try:
             ens_res = optimize_ensemble(base_results, test_data, mode, train_data)
             for e in ens_res: e['training_time'] = 0.1

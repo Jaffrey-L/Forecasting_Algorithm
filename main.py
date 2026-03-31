@@ -12,7 +12,7 @@ from config_and_utils import (
     SPUProfiler, SPUProfile, setup_logging, get_current_week_end, clean_series,
     calculate_wmape, detect_seasonality_strength, extract_seasonal_pattern,
     clean_params_for_db, plot_best_spu_style, extract_seasonal_factors_52week,
-    calculate_dynamic_shares
+    calculate_dynamic_shares, calculate_principal_dynamic_shares
 )
 from algorithm_engine import *
 
@@ -104,8 +104,12 @@ def process_single_spu(spu, df_spu, mode='smart', exog_cols=None, collect_viz=Fa
             profiler.print_model_competition(profile)
             profiler.print_forecast_summary(profile, future_dates, final_preds)
 
-        # ✅ 接收两个返回值：json_list 写库，share_df 绘图
+        # ✅ SKU 份额预测：json_list 写库，share_df 绘图
         share_json_list, share_df = calculate_dynamic_shares(df_spu_idx, spu, series_clean, future_dates)
+        # ✅ 负责人权重预测：仅作为 JSON 字段写入，不改变入库颗粒度
+        principal_share_json_list, _principal_share_df = calculate_principal_dynamic_shares(
+            df_spu_idx, series_clean, future_dates
+        )
         # ✅ 提取 52 周季节因子
         seasonal_factors_json = extract_seasonal_factors_52week(series_clean, period=52)
 
@@ -176,6 +180,7 @@ def process_single_spu(spu, df_spu, mode='smart', exog_cols=None, collect_viz=Fa
             'forecast_target_date': [d.date() for d in future_dates],
             'spu_forecast_value':   np.round(final_preds, 4),
             'sku_share_json':       share_json_list,
+            'principal_share_json': principal_share_json_list,
             'seasonal_factors_json': seasonal_factors_json,  # ✅ 新增字段
             'sku_accuracy_json':    sku_accuracy_json,       # ✅ 新增: SKU 准确性评估
             'winner_algo':          winner['name'],
@@ -223,6 +228,7 @@ def get_data_from_db(db_url):
         select
         a."date" as report_date,
         local_sku,
+        coalesce(a.principal_names, 'UNKNOWN') as principal_names,
         case 
         when substring(local_sku,1,5)='RHNWB' then substring(local_sku,6,4)
         when substring(local_sku,1,2)='VY' then substring(local_sku,5,4)
@@ -236,9 +242,10 @@ def get_data_from_db(db_url):
         sum(ads_sd_cost+ads_sp_cost+ads_sb_cost+ads_sbv_cost) as 广告费
         from lx_ods.查询订单利润_msku_cny_5年版 a 
         left join lx_ods.查询订单利润_msku_cny_商品基础信息_5年版 b on a.__dm_key=b.__dm_key
-        group by 1,2,3
+        group by 1,2,3,4
     )
     select report_date as date, sum(销量) as sales, SPU as spu, local_sku as sku,
+           max(principal_names) as principal_names,
            ROUND(SUM(-广告费)::NUMERIC, 2) as ad_cost, avg(平均售价) as price
     from base 
     where 1=1{spu_filter_sql}
