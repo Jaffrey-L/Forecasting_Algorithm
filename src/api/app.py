@@ -1,3 +1,4 @@
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -17,6 +18,7 @@ frontend_root = os.path.join(project_root, "frontend")
 static_root = os.path.join(project_root, "static")
 dashboard_v2_path = os.path.join(project_root, "forecast_dashboard_v2.html")
 platform_db = os.path.join(project_root, "data", "platform_state.db")
+weekly_schedule_path = os.path.join(project_root, "data", "weekly_schedule.json")
 db_url = os.getenv(
     "SALES_FORECAST_DB_URL",
     "postgresql+psycopg2://postgres:vayiERty123@192.168.1.226:5432/finedatalink",
@@ -91,11 +93,67 @@ class ScheduleUpsertRequest(BaseModel):
     enabled: bool = True
 
 
+class WeeklyScheduleRequest(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    timezone: str = "Asia/Shanghai"
+    enabled: bool = True
+
+
 def _selection_payload(request: Any):
     return {
         "manual_spus": getattr(request, "manual_spus", ""),
         "sql_query": getattr(request, "sql_query", ""),
     }
+
+
+def _default_weekly_schedule() -> dict[str, Any]:
+    return {
+        "weekday": 0,
+        "hour": 1,
+        "minute": 0,
+        "timezone": "Asia/Shanghai",
+        "enabled": True,
+        "display_text": "每周一 01:00",
+        "linux_timer_sync_required": True,
+    }
+
+
+def _hydrate_weekly_schedule(payload: dict[str, Any]) -> dict[str, Any]:
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday = int(payload.get("weekday", 0))
+    hour = int(payload.get("hour", 1))
+    minute = int(payload.get("minute", 0))
+    enabled = bool(payload.get("enabled", True))
+    return {
+        "weekday": weekday,
+        "hour": hour,
+        "minute": minute,
+        "timezone": payload.get("timezone", "Asia/Shanghai"),
+        "enabled": enabled,
+        "display_text": f"{weekdays[weekday]} {hour:02d}:{minute:02d}",
+        "linux_timer_sync_required": True,
+    }
+
+
+def _read_weekly_schedule() -> dict[str, Any]:
+    if not os.path.exists(weekly_schedule_path):
+        return _default_weekly_schedule()
+    try:
+        with open(weekly_schedule_path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return _default_weekly_schedule()
+    return _hydrate_weekly_schedule(raw)
+
+
+def _write_weekly_schedule(payload: dict[str, Any]) -> dict[str, Any]:
+    os.makedirs(os.path.dirname(weekly_schedule_path), exist_ok=True)
+    schedule = _hydrate_weekly_schedule(payload)
+    with open(weekly_schedule_path, "w", encoding="utf-8") as fh:
+        json.dump(schedule, fh, ensure_ascii=False, indent=2)
+    return schedule
 
 
 def _preferred_run(run_id: Optional[str] = None):
@@ -337,6 +395,16 @@ async def upsert_forecast_schedule(request: ScheduleUpsertRequest):
 @app.get("/api/forecast-schedules")
 async def list_forecast_schedules():
     return store.list_schedules()
+
+
+@app.get("/api/weekly-schedule")
+async def get_weekly_schedule():
+    return _read_weekly_schedule()
+
+
+@app.post("/api/weekly-schedule")
+async def save_weekly_schedule(request: WeeklyScheduleRequest):
+    return _write_weekly_schedule(request.model_dump())
 
 
 @app.post("/api/start-analysis")
