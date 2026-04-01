@@ -7,6 +7,8 @@ const state = {
   resultLoadedFor: null,
   linuxOps: null,
   startingRun: false,
+  clientLogs: [],
+  pendingLogTimer: null,
 };
 
 const selectionHelp = {
@@ -56,6 +58,42 @@ function renderLogs(logs, emptyText = "暂无可展示日志") {
       return `<div class="${css}">${head}${escapeHtml(log.message)}</div>`;
     })
     .join("");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function clearPendingClientLogs() {
+  if (state.pendingLogTimer) {
+    clearInterval(state.pendingLogTimer);
+    state.pendingLogTimer = null;
+  }
+}
+
+function pushClientLog(message, level = "info") {
+  state.clientLogs.unshift({
+    source: "前端",
+    timestamp: nowIso(),
+    message,
+    level,
+  });
+  state.clientLogs = state.clientLogs.slice(0, 20);
+  const container = el("logList");
+  if (container) {
+    container.innerHTML = renderLogs(state.clientLogs, "当前暂无可展示日志");
+  }
+}
+
+function startPendingClientLogs(message) {
+  clearPendingClientLogs();
+  pushClientLog(message, "info");
+  let heartbeat = 0;
+  state.pendingLogTimer = setInterval(() => {
+    heartbeat += 1;
+    const suffix = heartbeat % 2 === 0 ? "仍在处理中，请稍候..." : "后端正在准备数据，请不要重复点击。";
+    pushClientLog(`${message} ${suffix}`, "info");
+  }, 5000);
 }
 
 function renderPills(containerId, values, emptyText = "暂无数据") {
@@ -166,11 +204,16 @@ async function resolveSelection() {
 async function startRun() {
   state.startingRun = true;
   setStartButtonBusy(true);
-  setRunFeedback("任务正在提交，日志区会自动刷新。", "info");
+  const pendingMessage = state.selectionType === "all"
+    ? "正在解析全量 SPU 范围并提交任务，这一步可能需要几十秒。"
+    : "任务正在提交，日志区会自动刷新。";
+  setRunFeedback(pendingMessage, "info");
+  startPendingClientLogs(pendingMessage);
   focusTaskStatus();
   try {
     if (!state.resolvedSelection || state.resolvedSelection.selection_type !== state.selectionType) {
       await resolveSelection();
+      pushClientLog(`范围解析完成，共 ${state.resolvedSelection?.count || 0} 个 SPU。`, "info");
     }
     const result = await api("/api/forecast-jobs", {
       method: "POST",
@@ -179,9 +222,11 @@ async function startRun() {
         mode: el("modeSelect").value,
       }),
     });
+    clearPendingClientLogs();
     state.currentRunId = result.run_id;
     updateRunHeader(result.run);
     setRunFeedback("任务已启动，正在等待运行日志。", "success");
+    pushClientLog(`任务已创建，运行编号 ${result.run_id.slice(0, 8)}。`, "info");
     await loadRunStatus();
     startPolling();
   } finally {
@@ -193,7 +238,10 @@ async function startRun() {
 async function stopRun() {
   if (!state.currentRunId) return;
   setRunFeedback("已发送停止指令，正在等待任务收尾。", "warning");
+  startPendingClientLogs("正在发送停止指令。");
   const run = await api(`/api/forecast-jobs/${state.currentRunId}/stop`, { method: "POST" });
+  clearPendingClientLogs();
+  pushClientLog(`停止指令已送达，任务 ${run.id.slice(0, 8)} 正在收尾。`, "warning");
   updateRunHeader(run);
   await loadRunStatus();
 }
@@ -213,6 +261,7 @@ async function loadRunStatus() {
     if (!state.startingRun) {
       setRunFeedback("", "info", false);
     }
+    clearPendingClientLogs();
     await loadLinuxOps();
     await loadExecutionLogs();
     return;
@@ -224,12 +273,17 @@ async function loadRunStatus() {
     setRunFeedback("任务已进入队列，正在准备执行。", "info");
   } else if (run.status === "running") {
     setRunFeedback("任务正在执行，日志会持续刷新。", "success");
+    clearPendingClientLogs();
   } else if (run.status === "stopping") {
     setRunFeedback("任务正在停止，请稍等。", "warning");
   } else if (run.status === "completed") {
     setRunFeedback("任务已完成，可以查看预测结果。", "success");
+    clearPendingClientLogs();
+    pushClientLog(`任务 ${run.id.slice(0, 8)} 已完成。`, "info");
   } else if (run.status === "failed") {
     setRunFeedback("任务执行失败，请直接查看上方日志。", "warning");
+    clearPendingClientLogs();
+    pushClientLog(`任务 ${run.id.slice(0, 8)} 执行失败。`, "error");
   }
   await Promise.all([loadRunSpus(), loadLinuxOps()]);
   await loadExecutionLogs();
@@ -343,10 +397,12 @@ async function loadExecutionLogs() {
     : "启动后会自动刷新";
   if (!logs.length) {
     const emptyText = state.currentRunId ? "任务已启动，正在等待日志输出..." : "当前暂无可展示日志";
-    container.innerHTML = renderLogs([], emptyText);
+    const mergedLogs = state.clientLogs.length ? state.clientLogs : [];
+    container.innerHTML = renderLogs(mergedLogs, emptyText);
     return;
   }
-  container.innerHTML = renderLogs(logs);
+  const mergedLogs = [...state.clientLogs, ...logs].slice(0, 80);
+  container.innerHTML = renderLogs(mergedLogs);
   container.scrollTop = container.scrollHeight;
 }
 
@@ -520,6 +576,8 @@ function bindEvents() {
 function handleError(error) {
   state.startingRun = false;
   setStartButtonBusy(false);
+  clearPendingClientLogs();
+  pushClientLog(error.message || String(error), "error");
   setRunFeedback(error.message || String(error), "warning");
   alert(error.message || String(error));
 }

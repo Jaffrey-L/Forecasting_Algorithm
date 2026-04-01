@@ -1,5 +1,6 @@
 import re
 import threading
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,33 @@ from src.forecasting.execution_bridge import get_data_from_db, process_single_sp
 TOKEN_SPLIT_RE = re.compile(r"[\s,;|\r\n\t]+")
 VALID_MODES = {"fast", "smart", "full"}
 DEFAULT_SCOPE_MIN_WEEKS = 108
+DEFAULT_SCOPE_RECENT_WEEKS = 4
+
+
+class _RunLogStream:
+    def __init__(self, emit):
+        self._emit = emit
+        self._buffer = ""
+
+    def write(self, chunk: str) -> int:
+        text = str(chunk or "")
+        if not text:
+            return 0
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._flush_line(line)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._flush_line(self._buffer)
+            self._buffer = ""
+
+    def _flush_line(self, line: str) -> None:
+        cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).strip()
+        if cleaned:
+            self._emit(cleaned)
 
 
 def normalize_spu_values(series: pd.Series) -> pd.Series:
@@ -189,20 +217,33 @@ class ForecastRuntimeManager:
             return all_spus, len(all_spus)
 
         # The default "all" scope is restricted to SPUs with at least 108
-        # weekly observations so Linux scheduled runs follow the same business rule.
+        # weekly observations, and each of the latest 4 weekly buckets must
+        # have non-zero sales so Linux scheduled runs skip recently inactive SPUs.
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["spu"] = normalize_spu_values(df["spu"])
-        df = df.dropna(subset=["spu"])
+        df["sales"] = pd.to_numeric(df.get("sales"), errors="coerce").fillna(0.0)
+        df = df.dropna(subset=["spu", "date"])
         all_spus = sorted(df["spu"].unique().tolist())
-        weekly_counts = (
-            df.dropna(subset=["date"])
-            .assign(
-                week_bucket=df["date"].dt.to_period("W").astype(str),
-            )
-            .groupby("spu")["week_bucket"]
-            .nunique()
+        weekly_sales = (
+            df.assign(week_bucket=df["date"].dt.to_period("W").dt.start_time)
+            .groupby(["spu", "week_bucket"], as_index=False)["sales"]
+            .sum()
         )
-        eligible_spus = weekly_counts[weekly_counts >= DEFAULT_SCOPE_MIN_WEEKS].index.tolist()
+        weekly_counts = weekly_sales.groupby("spu")["week_bucket"].nunique()
+        recent_week_buckets = sorted(weekly_sales["week_bucket"].dropna().unique().tolist())[-DEFAULT_SCOPE_RECENT_WEEKS :]
+        if len(recent_week_buckets) < DEFAULT_SCOPE_RECENT_WEEKS:
+            return [], len(all_spus)
+
+        recent_sales = (
+            weekly_sales[weekly_sales["week_bucket"].isin(recent_week_buckets)]
+            .pivot(index="spu", columns="week_bucket", values="sales")
+            .reindex(columns=recent_week_buckets, fill_value=0.0)
+            .fillna(0.0)
+        )
+        active_recent_spus = recent_sales.index[(recent_sales > 0).all(axis=1)]
+        eligible_spus = active_recent_spus[
+            weekly_counts.reindex(active_recent_spus, fill_value=0) >= DEFAULT_SCOPE_MIN_WEEKS
+        ].tolist()
         return sorted(eligible_spus), len(all_spus)
 
     def _execute_run(self, run_id: str, stop_event: threading.Event) -> None:
@@ -246,14 +287,19 @@ class ForecastRuntimeManager:
                 self.store.upsert_run_spu(run_id, spu, "running", message="Processing")
                 self._append_log(run_id, "info", f"Processing SPU {spu} ({index}/{total_spus}).")
                 df_spu = df_all[df_all["spu"] == spu].copy()
-                result_df, message, _viz, _profile = process_single_spu(
-                    spu,
-                    df_spu,
-                    mode=run["mode"],
-                    exog_cols=exog_cols,
-                    collect_viz=False,
-                    verbose=False,
+                spu_log_stream = _RunLogStream(
+                    lambda line, current_spu=spu: self._append_log(run_id, "info", f"[SPU {current_spu}] {line}")
                 )
+                with redirect_stdout(spu_log_stream), redirect_stderr(spu_log_stream):
+                    result_df, message, _viz, _profile = process_single_spu(
+                        spu,
+                        df_spu,
+                        mode=run["mode"],
+                        exog_cols=exog_cols,
+                        collect_viz=False,
+                        verbose=False,
+                    )
+                spu_log_stream.flush()
                 if result_df is not None:
                     all_results.append(result_df)
                     successful += 1

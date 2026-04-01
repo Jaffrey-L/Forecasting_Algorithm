@@ -388,3 +388,48 @@ def test_sql_selection_rejects_non_spu_shape(monkeypatch, tmp_path):
         assert False, "Expected ValueError"
     except ValueError as exc:
         assert "exactly one column named spu" in str(exc)
+
+
+def test_manual_selection_is_not_filtered_by_all_scope_rules(tmp_path):
+    store = PlatformStore(str(tmp_path / "platform_state.db"))
+    manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
+
+    result = manager.resolve_selection("manual", {"manual_spus": "SPU001\nSPU002"})
+
+    assert result["selected_spus"] == ["SPU001", "SPU002"]
+    assert result["count"] == 2
+
+
+def test_all_selection_excludes_spus_with_zero_sales_in_any_recent_week(monkeypatch, tmp_path):
+    import pandas as pd
+    import src.api.runtime as runtime_module
+
+    weekly_dates = list(pd.date_range("2024-01-07", periods=10, freq="W"))
+    df = pd.DataFrame(
+        {
+            "date": weekly_dates + weekly_dates + weekly_dates + weekly_dates[:6],
+            "spu": ["SPU001"] * 10 + ["SPU002"] * 10 + ["SPU003"] * 10 + ["SPU004"] * 6,
+            "sales": (
+                [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+                + [5, 6, 7, 8, 9, 10, 11, 12, 0, 14]
+                + [5, 6, 7, 8, 9, 10, 0, 12, 13, 14]
+                + [5, 6, 7, 8, 9, 10]
+            ),
+            "sku": ["SKU001"] * 10 + ["SKU002"] * 10 + ["SKU003"] * 10 + ["SKU004"] * 6,
+        }
+    )
+
+    monkeypatch.setattr(runtime_module, "get_data_from_db", lambda _db_url: df)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_WEEKS", 1)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WEEKS", 4)
+
+    store = PlatformStore(str(tmp_path / "platform_state.db"))
+    manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
+
+    result = manager.resolve_selection("all", {})
+
+    assert result["selected_spus"] == ["SPU001"]
+    assert result["count"] == 1
+    assert result["scope_total_spus"] == 4
+    assert result["scope_eligible_spus"] == 1
+    assert result["scope_excluded_spus"] == 3
