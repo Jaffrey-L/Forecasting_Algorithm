@@ -100,6 +100,11 @@ textarea { min-height: 130px; resize: vertical; margin-bottom: 16px; }
 .helper-text, .muted { color: var(--muted); font-size: 13px; }
 .actions, .inline-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
 
+.feedback { margin: 0 0 18px; padding: 14px 16px; border-radius: 16px; font-size: 14px; font-weight: 600; }
+.feedback-info { background: rgba(21, 94, 99, 0.1); color: var(--brand-strong); }
+.feedback-success { background: rgba(53, 144, 110, 0.12); color: #1e6b52; }
+.feedback-warning { background: rgba(180, 35, 24, 0.12); color: #9f291f; }
+
 .btn { border: none; border-radius: 16px; padding: 12px 16px; cursor: pointer; font-weight: 700; }
 .btn-primary { background: linear-gradient(135deg, var(--brand), #2c7a7f); color: white; }
 .btn-secondary { background: linear-gradient(135deg, #f0ebe2, #ded8cd); color: var(--ink); }
@@ -135,7 +140,13 @@ textarea { min-height: 130px; resize: vertical; margin-bottom: 16px; }
 .stack-item p { margin: 4px 0; color: var(--muted); font-size: 13px; }
 
 .top-gap { margin-top: 18px; }
+.live-log-panel { padding: 18px; border-radius: 20px; background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(244, 239, 231, 0.9)); border: 1px solid rgba(125, 148, 140, 0.16); }
+.secondary-panel { border-radius: 20px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.45); }
+.secondary-panel summary { list-style: none; cursor: pointer; padding: 18px 20px; font-weight: 700; }
+.secondary-panel summary::-webkit-details-marker { display: none; }
+.secondary-panel-body { padding: 0 20px 20px; }
 .log-list { min-height: 320px; max-height: 420px; overflow: auto; border-radius: 18px; background: #172328; color: #d4e7e3; padding: 16px; }
+.log-list.compact { min-height: 240px; max-height: 320px; }
 .log-list.wide { min-height: 420px; max-height: 520px; }
 .log-entry { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid rgba(212, 231, 227, 0.08); font-size: 13px; line-height: 1.55; }
 .log-time { color: #8ec5c0; margin-right: 8px; }

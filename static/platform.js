@@ -6,6 +6,7 @@ const state = {
   configs: [],
   resultLoadedFor: null,
   linuxOps: null,
+  startingRun: false,
 };
 
 const selectionHelp = {
@@ -25,6 +26,36 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function setRunFeedback(message = "", tone = "info", visible = true) {
+  const feedback = el("runFeedback");
+  feedback.className = `feedback feedback-${tone}${visible ? "" : " hidden"}`;
+  feedback.textContent = message;
+}
+
+function setStartButtonBusy(isBusy, label = "启动任务") {
+  const startButton = el("startJobBtn");
+  startButton.disabled = isBusy;
+  startButton.textContent = isBusy ? "启动中..." : label;
+}
+
+function focusTaskStatus() {
+  el("runBadge")?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function renderLogs(logs, emptyText = "暂无可展示日志") {
+  if (!logs.length) {
+    return `<div class="log-entry">${escapeHtml(emptyText)}</div>`;
+  }
+  return logs
+    .map((log) => {
+      const css = log.level === "error" ? "log-entry error" : "log-entry";
+      const prefix = [log.source, log.timestamp || log.created_at].filter(Boolean).join(" | ");
+      const head = prefix ? `<span class="log-time">${escapeHtml(prefix)}</span>` : "";
+      return `<div class="${css}">${head}${escapeHtml(log.message)}</div>`;
+    })
+    .join("");
 }
 
 function renderPills(containerId, values, emptyText = "暂无数据") {
@@ -133,25 +164,38 @@ async function resolveSelection() {
 }
 
 async function startRun() {
-  if (!state.resolvedSelection || state.resolvedSelection.selection_type !== state.selectionType) {
-    await resolveSelection();
+  state.startingRun = true;
+  setStartButtonBusy(true);
+  setRunFeedback("任务正在提交，日志区会自动刷新。", "info");
+  focusTaskStatus();
+  try {
+    if (!state.resolvedSelection || state.resolvedSelection.selection_type !== state.selectionType) {
+      await resolveSelection();
+    }
+    const result = await api("/api/forecast-jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        ...getSelectionPayload(),
+        mode: el("modeSelect").value,
+      }),
+    });
+    state.currentRunId = result.run_id;
+    updateRunHeader(result.run);
+    setRunFeedback("任务已启动，正在等待运行日志。", "success");
+    await loadRunStatus();
+    startPolling();
+  } finally {
+    state.startingRun = false;
+    setStartButtonBusy(false);
   }
-  const result = await api("/api/forecast-jobs", {
-    method: "POST",
-    body: JSON.stringify({
-      ...getSelectionPayload(),
-      mode: el("modeSelect").value,
-    }),
-  });
-  state.currentRunId = result.run_id;
-  updateRunHeader(result.run);
-  startPolling();
 }
 
 async function stopRun() {
   if (!state.currentRunId) return;
+  setRunFeedback("已发送停止指令，正在等待任务收尾。", "warning");
   const run = await api(`/api/forecast-jobs/${state.currentRunId}/stop`, { method: "POST" });
   updateRunHeader(run);
+  await loadRunStatus();
 }
 
 async function loadRunStatus() {
@@ -164,8 +208,11 @@ async function loadRunStatus() {
     el("successValue").textContent = "0";
     el("currentSpuValue").textContent = "-";
     el("progressBar").style.width = "0%";
-    el("heroLastRun").textContent = "鏆傛棤";
+    el("heroLastRun").textContent = "暂无";
     el("stopJobBtn").classList.add("hidden");
+    if (!state.startingRun) {
+      setRunFeedback("", "info", false);
+    }
     await loadLinuxOps();
     await loadExecutionLogs();
     return;
@@ -173,6 +220,17 @@ async function loadRunStatus() {
   const run = runs[0];
   state.currentRunId = run.id;
   updateRunHeader(run);
+  if (run.status === "queued") {
+    setRunFeedback("任务已进入队列，正在准备执行。", "info");
+  } else if (run.status === "running") {
+    setRunFeedback("任务正在执行，日志会持续刷新。", "success");
+  } else if (run.status === "stopping") {
+    setRunFeedback("任务正在停止，请稍等。", "warning");
+  } else if (run.status === "completed") {
+    setRunFeedback("任务已完成，可以查看预测结果。", "success");
+  } else if (run.status === "failed") {
+    setRunFeedback("任务执行失败，请直接查看上方日志。", "warning");
+  }
   await Promise.all([loadRunSpus(), loadLinuxOps()]);
   await loadExecutionLogs();
   if (!["queued", "running", "stopping"].includes(run.status) && state.pollingTimer) {
@@ -280,16 +338,15 @@ async function loadExecutionLogs() {
   if (ops?.logs?.source?.status) sourceParts.push(ops.logs.source.status);
   if (ops?.logs?.source?.run_id) sourceParts.push(ops.logs.source.run_id.slice(0, 8));
   el("linuxOpsSummary").textContent = sourceParts.length ? `日志来源：${sourceParts.join(" / ")}` : "日志来源已更新";
+  el("liveLogHint").textContent = ops?.logs?.source?.label
+    ? `当前显示：${ops.logs.source.label}`
+    : "启动后会自动刷新";
   if (!logs.length) {
-    container.innerHTML = `<div class="log-entry">暂无可展示日志</div>`;
+    const emptyText = state.currentRunId ? "任务已启动，正在等待日志输出..." : "当前暂无可展示日志";
+    container.innerHTML = renderLogs([], emptyText);
     return;
   }
-  container.innerHTML = logs.map((log) => {
-    const css = log.level === "error" ? "log-entry error" : "log-entry";
-    const prefix = [log.source, log.timestamp].filter(Boolean).join(" | ");
-    const head = prefix ? `<span class="log-time">${escapeHtml(prefix)}</span>` : "";
-    return `<div class="${css}">${head}${escapeHtml(log.message)}</div>`;
-  }).join("");
+  container.innerHTML = renderLogs(logs);
   container.scrollTop = container.scrollHeight;
 }
 
@@ -367,10 +424,21 @@ async function loadConfigs() {
 }
 
 async function runConfig(configId) {
-  const result = await api(`/api/forecast-configs/${configId}/run`, { method: "POST" });
-  state.currentRunId = result.run_id;
-  updateRunHeader(result.run);
-  startPolling();
+  state.startingRun = true;
+  setStartButtonBusy(true, "模板启动中...");
+  setRunFeedback("模板任务正在提交，日志区会自动刷新。", "info");
+  focusTaskStatus();
+  try {
+    const result = await api(`/api/forecast-configs/${configId}/run`, { method: "POST" });
+    state.currentRunId = result.run_id;
+    updateRunHeader(result.run);
+    setRunFeedback("模板任务已启动，正在等待运行日志。", "success");
+    await loadRunStatus();
+    startPolling();
+  } finally {
+    state.startingRun = false;
+    setStartButtonBusy(false);
+  }
 }
 
 window.runConfig = runConfig;
@@ -450,12 +518,16 @@ function bindEvents() {
 }
 
 function handleError(error) {
+  state.startingRun = false;
+  setStartButtonBusy(false);
+  setRunFeedback(error.message || String(error), "warning");
   alert(error.message || String(error));
 }
 
 async function bootstrap() {
   bindEvents();
   setSelectionType("all");
+  setRunFeedback("", "info", false);
   updateResultKpis(null);
   await Promise.all([loadConfigs(), loadSchedules(), loadRunStatus(), loadLinuxOps()]);
   if (state.currentRunId) {

@@ -53,6 +53,7 @@
                     <button id="startJobBtn" class="btn btn-primary">启动任务</button>
                     <button id="stopJobBtn" class="btn btn-danger hidden">停止任务</button>
                 </div>
+                <div id="runFeedback" class="feedback hidden"></div>
                 <div class="preview-box">
                     <div class="preview-topline">
                         <strong>SPU 预览</strong>
@@ -60,23 +61,24 @@
                     </div>
                     <div id="selectionPreview" class="pill-list muted">等待解析</div>
                 </div>
-                <hr>
-                <div class="panel-header compact">
-                    <h2>配置模板</h2>
-                </div>
-                <label class="field">
-                    <span>配置名称</span>
-                    <input id="configName" type="text" placeholder="例如：每周核心 SPU 预测">
-                </label>
-                <label class="field">
-                    <span>业务用途</span>
-                    <input id="configPurpose" type="text" placeholder="例如：运营周会 / 补货决策">
-                </label>
-                <div class="actions">
-                    <button id="saveConfigBtn" class="btn btn-secondary">保存配置</button>
-                    <button id="refreshConfigsBtn" class="btn btn-ghost">刷新列表</button>
-                </div>
-                <div id="configList" class="stack-list"></div>
+                <details class="secondary-panel top-gap">
+                    <summary>高级设置：配置模板</summary>
+                    <div class="secondary-panel-body">
+                        <label class="field">
+                            <span>配置名称</span>
+                            <input id="configName" type="text" placeholder="例如：每周核心 SPU 预测">
+                        </label>
+                        <label class="field">
+                            <span>业务用途</span>
+                            <input id="configPurpose" type="text" placeholder="例如：运营周会 / 补货决策">
+                        </label>
+                        <div class="actions">
+                            <button id="saveConfigBtn" class="btn btn-secondary">保存配置</button>
+                            <button id="refreshConfigsBtn" class="btn btn-ghost">刷新列表</button>
+                        </div>
+                        <div id="configList" class="stack-list"></div>
+                    </div>
+                </details>
             </section>
 
             <section class="panel">
@@ -91,13 +93,23 @@
                     <article class="metric"><span>当前 SPU</span><strong id="currentSpuValue">-</strong></article>
                 </div>
                 <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
-                <div class="split-card">
-                    <div>
-                        <h3>最近任务摘要</h3>
-                        <div id="runSummary" class="summary-grid muted">暂无运行数据</div>
+                <div class="live-log-panel top-gap">
+                    <div class="panel-header compact">
+                        <h3>实时日志</h3>
+                        <div class="actions">
+                            <span id="liveLogHint" class="muted">启动后会自动刷新</span>
+                            <button id="refreshLogsBtn" class="btn btn-ghost">刷新日志</button>
+                        </div>
                     </div>
-                    <div>
-                        <h3>执行计划</h3>
+                    <div id="logList" class="log-list compact"></div>
+                </div>
+                <div class="top-gap">
+                    <h3>最近任务摘要</h3>
+                    <div id="runSummary" class="summary-grid muted">暂无运行数据</div>
+                </div>
+                <details class="secondary-panel top-gap">
+                    <summary>高级设置：执行计划</summary>
+                    <div class="secondary-panel-body">
                         <label class="field inline">
                             <span>模板</span>
                             <select id="scheduleConfigSelect"></select>
@@ -118,28 +130,32 @@
                         </div>
                         <div id="scheduleList" class="stack-list compact"></div>
                     </div>
-                </div>
+                </details>
             </section>
 
             <section class="panel span-full">
-                <div class="panel-header compact">
-                    <h2>Linux 运维状态</h2>
-                    <div class="actions">
-                        <span id="linuxOpsSummary" class="muted">等待刷新</span>
-                        <button id="refreshLinuxOpsBtn" class="btn btn-ghost">刷新运维状态</button>
+                <details class="secondary-panel">
+                    <summary>高级信息：Linux 运维状态</summary>
+                    <div class="secondary-panel-body">
+                        <div class="panel-header compact">
+                            <div class="actions">
+                                <span id="linuxOpsSummary" class="muted">等待刷新</span>
+                                <button id="refreshLinuxOpsBtn" class="btn btn-ghost">刷新运维状态</button>
+                            </div>
+                        </div>
+                        <div class="summary-grid">
+                            <div class="summary-item">
+                                <span class="muted">当前日志来源</span>
+                                <strong id="linuxLogSourceValue">-</strong>
+                            </div>
+                            <div class="summary-item">
+                                <span class="muted">下次定期执行</span>
+                                <strong id="linuxNextRunValue">-</strong>
+                            </div>
+                        </div>
+                        <div id="linuxServiceList" class="stack-list top-gap"></div>
                     </div>
-                </div>
-                <div class="summary-grid">
-                    <div class="summary-item">
-                        <span class="muted">当前日志来源</span>
-                        <strong id="linuxLogSourceValue">-</strong>
-                    </div>
-                    <div class="summary-item">
-                        <span class="muted">下次定期执行</span>
-                        <strong id="linuxNextRunValue">-</strong>
-                    </div>
-                </div>
-                <div id="linuxServiceList" class="stack-list top-gap"></div>
+                </details>
             </section>
 
             <section class="panel span-full">
@@ -184,21 +200,10 @@
             </section>
 
             <section class="panel span-full">
-                <div class="detail-grid">
-                    <div>
-                        <div class="panel-header">
-                            <h2>SPU 状态</h2>
-                        </div>
-                        <div id="spuList" class="stack-list tall"></div>
-                    </div>
-                    <div>
-                        <div class="panel-header">
-                            <h2>执行日志</h2>
-                            <button id="refreshLogsBtn" class="btn btn-ghost">刷新</button>
-                        </div>
-                        <div id="logList" class="log-list wide"></div>
-                    </div>
+                <div class="panel-header">
+                    <h2>SPU 状态</h2>
                 </div>
+                <div id="spuList" class="stack-list tall"></div>
             </section>
         </main>
     </div>
