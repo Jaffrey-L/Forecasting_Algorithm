@@ -15,6 +15,11 @@ VALID_MODES = {"fast", "smart", "full"}
 DEFAULT_SCOPE_MIN_WEEKS = 108
 
 
+def normalize_spu_values(series: pd.Series) -> pd.Series:
+    normalized = series.astype(str).str.strip()
+    return normalized[(normalized != "") & (normalized != "-")]
+
+
 def parse_manual_spus(raw: str) -> Dict[str, Any]:
     tokens = [token.strip() for token in TOKEN_SPLIT_RE.split(raw or "") if token.strip()]
     seen = set()
@@ -181,17 +186,21 @@ class ForecastRuntimeManager:
             return [], 0
         df.columns = [str(col).lower() for col in df.columns]
         if "date" not in df.columns or "spu" not in df.columns:
-            all_spus = sorted(df["spu"].astype(str).unique().tolist())
+            all_spus = sorted(normalize_spu_values(df["spu"]).unique().tolist())
             return all_spus, len(all_spus)
 
         # The default "all" scope is restricted to SPUs with at least 108
         # weekly observations so Linux scheduled runs follow the same business rule.
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        all_spus = sorted(df["spu"].astype(str).unique().tolist())
+        df["spu"] = normalize_spu_values(df["spu"])
+        df = df.dropna(subset=["spu"])
+        all_spus = sorted(df["spu"].unique().tolist())
         weekly_counts = (
             df.dropna(subset=["date"])
-            .assign(spu=df["spu"].astype(str))
-            .groupby("spu")["date"]
+            .assign(
+                week_bucket=df["date"].dt.to_period("W").astype(str),
+            )
+            .groupby("spu")["week_bucket"]
             .nunique()
         )
         eligible_spus = weekly_counts[weekly_counts >= DEFAULT_SCOPE_MIN_WEEKS].index.tolist()
