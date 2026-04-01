@@ -1,4 +1,4 @@
-"""Canonical forecast execution kernel.
+﻿"""Canonical forecast execution kernel.
 
 `process_single_spu` lives here now so the runtime can depend on a stable
 `src.forecasting` surface instead of importing the legacy root `main.py`.
@@ -64,17 +64,16 @@ def _build_training_data_query() -> str:
         else '-' end as SPU,
         sum(afn_amount+mfn_amount+promotion_discount+refund_amount+cost_of_points_granted+inventory_credit+shared_fba_liquidation_proceeds+shared_fba_liquidation_proceeds_adjustments
         +shared_amazon_shipping_reimbursement+shared_safe_t_reimbursement+shared_netco_transaction+shared_reimbursements+shared_clawbacks+shared_commingling_vat_income+gift_wrap_credits
-        +a_to_z_guarantee_claims+shared_others+shipping_cost) as 销售额,
-        sum(a.volume) as 销量,
-        avg(avg_net_amount) as 平均售价,
-        sum(ads_sd_cost+ads_sp_cost+ads_sb_cost+ads_sbv_cost) as 广告费
-        from lx_ods.查询订单利润_msku_cny_5年版 a
-        left join lx_ods.查询订单利润_msku_cny_商品基础信息_5年版 b on a.__dm_key=b.__dm_key
+        +a_to_z_guarantee_claims+shared_others+shipping_cost) as 閿€鍞,
+        sum(a.volume) as 閿€閲?
+        avg(avg_net_amount) as 骞冲潎鍞环,
+        sum(ads_sd_cost+ads_sp_cost+ads_sb_cost+ads_sbv_cost) as 骞垮憡璐?        from lx_ods.鏌ヨ璁㈠崟鍒╂鼎_msku_cny_5骞寸増 a
+        left join lx_ods.鏌ヨ璁㈠崟鍒╂鼎_msku_cny_鍟嗗搧鍩虹淇℃伅_5骞寸増 b on a.__dm_key=b.__dm_key
         group by 1,2,3,4
     )
-    select report_date as date, sum(销量) as sales, SPU as spu, local_sku as sku,
+    select report_date as date, sum(閿€閲? as sales, SPU as spu, local_sku as sku,
            max(principal_names) as principal_names,
-           ROUND(SUM(-广告费)::NUMERIC, 2) as ad_cost, avg(平均售价) as price
+           ROUND(SUM(-骞垮憡璐?::NUMERIC, 2) as ad_cost, avg(骞冲潎鍞环) as price
     from base
     where 1=1{spu_filter_sql}
     group by report_date, SPU, local_sku
@@ -87,24 +86,24 @@ def get_data_from_db(db_url):
     query = _build_training_data_query()
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
-        print("尝试连接数据库...")
+        print("灏濊瘯杩炴帴鏁版嵁搴?..")
         with engine.connect() as conn:
-            print("数据库连接成功！")
-            print("开始执行SQL查询...")
+            print("鏁版嵁搴撹繛鎺ユ垚鍔燂紒")
+            print("寮€濮嬫墽琛孲QL鏌ヨ...")
             df = pd.read_sql(text(query), con=conn)
-            print(f"SQL查询执行成功，获取到 {len(df)} 行数据")
+            print(f"SQL query succeeded, fetched {len(df)} rows")
         df.columns = [col.lower() for col in df.columns]
-        print(f"数据获取完成！共加载 {len(df)} 行记录，耗时: {time.time() - t0:.1f} 秒")
+        print(f"Data load complete: {len(df)} rows loaded in {time.time() - t0:.1f} seconds")
         return df
     except Exception as exc:
         import traceback
 
-        print(f"数据获取失败: {exc}")
+        print(f"鏁版嵁鑾峰彇澶辫触: {exc}")
         traceback.print_exc()
         return pd.DataFrame()
     finally:
         engine.dispose()
-        print("数据库连接已关闭")
+        print("鏁版嵁搴撹繛鎺ュ凡鍏抽棴")
 
 
 def process_single_spu(
@@ -115,6 +114,7 @@ def process_single_spu(
     collect_viz=False,
     verbose=True,
     sku_accuracy_threshold=0.01,
+    log_fn=None,
 ):
     t0 = time.time()
     try:
@@ -161,8 +161,18 @@ def process_single_spu(
         test_exog = exog_series.iloc[-test_len:] if has_exog else None
 
         if verbose:
-            print(f"\n模型竞赛中 (mode={mode})...")
-        all_results, base_results = run_all_models(train, test, mode, train_exog, test_exog, verbose=False)
+            print(f"\nModel competition starting (mode={mode})...")
+        if log_fn is not None:
+            log_fn(f"SPU {spu} model competition starting, train={len(train)} weeks, test={len(test)} weeks.")
+        all_results, base_results = run_all_models(
+            train,
+            test,
+            mode,
+            train_exog,
+            test_exog,
+            verbose=False,
+            log_fn=(lambda message: log_fn(f"SPU {spu} | {message}")) if log_fn is not None else None,
+        )
         if not all_results:
             fallback_pred_test = np.full(len(test), float(test.mean()) if test.mean() > 0 else float(series_clean.mean()))
             fallback_wmape = float(
@@ -185,10 +195,13 @@ def process_single_spu(
         hist_cv = series_clean.std() / series_clean.mean() if series_clean.mean() > 0 else 0
         pred_cv = np.std(final_preds) / np.mean(final_preds) if np.mean(final_preds) > 0 else 0
         if verbose:
-            print(f"   波动性检查: 历史CV={hist_cv:.3f}, 预测CV={pred_cv:.3f}, 比值={pred_cv / hist_cv:.2f}")
+            print(f"   Volatility check: histCV={hist_cv:.3f}, predCV={pred_cv:.3f}, ratio={pred_cv / hist_cv:.2f}")
+        if log_fn is not None:
+            log_fn(f"SPU {spu} winner model: {winner['name']}, validation WMAPE {winner['wmape']:.2%}.")
+            log_fn(f"SPU {spu} forecast generated for {len(future_dates)} future weeks.")
         if pred_cv < hist_cv * 0.3:
             if verbose:
-                print("   警告: 预测波动性过低! 引擎已启动修正算法...")
+                print("   Warning: forecast volatility is unusually low; fallback smoothing will be applied.")
 
         fallback_value = float(series_clean.iloc[-8:].mean())
         final_preds = safe_predictions(final_preds, fallback_value, winner["name"])
@@ -249,7 +262,7 @@ def process_single_spu(
             sku_accuracy_json = json.dumps(sku_metrics, ensure_ascii=False)
         except Exception as exc:
             if verbose:
-                print(f"   SKU 评估失败: {exc}")
+                print(f"   SKU 璇勪及澶辫触: {exc}")
             sku_accuracy_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
 
         sku_future_df = share_df.multiply(final_preds, axis=0)
@@ -308,7 +321,7 @@ def process_single_spu(
         import traceback
 
         traceback.print_exc()
-        return None, f"错误: {str(exc)}", None, None
+        return None, f"閿欒: {str(exc)}", None, None
 
 
 def save_to_database(*args, **kwargs):

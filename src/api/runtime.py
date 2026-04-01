@@ -1,6 +1,6 @@
+import json
 import re
 import threading
-from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -16,32 +16,6 @@ TOKEN_SPLIT_RE = re.compile(r"[\s,;|\r\n\t]+")
 VALID_MODES = {"fast", "smart", "full"}
 DEFAULT_SCOPE_MIN_WEEKS = 108
 DEFAULT_SCOPE_RECENT_WEEKS = 4
-
-
-class _RunLogStream:
-    def __init__(self, emit):
-        self._emit = emit
-        self._buffer = ""
-
-    def write(self, chunk: str) -> int:
-        text = str(chunk or "")
-        if not text:
-            return 0
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            self._flush_line(line)
-        return len(text)
-
-    def flush(self) -> None:
-        if self._buffer:
-            self._flush_line(self._buffer)
-            self._buffer = ""
-
-    def _flush_line(self, line: str) -> None:
-        cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).strip()
-        if cleaned:
-            self._emit(cleaned)
 
 
 def normalize_spu_values(series: pd.Series) -> pd.Series:
@@ -150,23 +124,13 @@ class ForecastRuntimeManager:
     ) -> Dict[str, Any]:
         if mode not in VALID_MODES:
             raise ValueError("mode must be one of fast, smart, full")
-        resolved = self.resolve_selection(selection_type, selection_payload)
         run = self.store.create_run(
             config_id=config_id,
             trigger_source=trigger_source,
             mode=mode,
-            selection_type=resolved["selection_type"],
-            selection_payload=resolved["selection_payload"],
-            selected_spus=resolved["selected_spus"],
-        )
-        self.store.update_run(
-            run["id"],
-            summary={
-                "scope_total_spus": resolved.get("scope_total_spus", len(resolved["selected_spus"])),
-                "scope_eligible_spus": resolved.get("scope_eligible_spus", len(resolved["selected_spus"])),
-                "scope_excluded_spus": resolved.get("scope_excluded_spus", 0),
-                "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
-            },
+            selection_type=(selection_type or "").lower(),
+            selection_payload=selection_payload,
+            selected_spus=[],
         )
         stop_event = threading.Event()
         self._runs[run["id"]] = stop_event
@@ -250,9 +214,42 @@ class ForecastRuntimeManager:
         run = self.store.get_run(run_id)
         if not run:
             return
-        self.store.update_run(run_id, status="running", started_at=utcnow_iso())
+        self.store.update_run(
+            run_id,
+            status="running",
+            started_at=utcnow_iso(),
+            current_spu="解析SPU范围",
+            progress=0,
+        )
         self._append_log(run_id, "info", f"Run {run_id} started in {run['mode']} mode.")
         try:
+            self._append_log(
+                run_id,
+                "info",
+                f"Resolving selection scope for {run['selection_type']} mode.",
+            )
+            resolved = self.resolve_selection(run["selection_type"], run.get("selection_payload", {}))
+            self.store.update_run(
+                run_id,
+                selected_spus_json=json.dumps(resolved["selected_spus"], ensure_ascii=False),
+                summary={
+                    "scope_total_spus": resolved.get("scope_total_spus", len(resolved["selected_spus"])),
+                    "scope_eligible_spus": resolved.get("scope_eligible_spus", len(resolved["selected_spus"])),
+                    "scope_excluded_spus": resolved.get("scope_excluded_spus", 0),
+                    "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+                },
+            )
+            run["summary"] = {
+                "scope_total_spus": resolved.get("scope_total_spus", len(resolved["selected_spus"])),
+                "scope_eligible_spus": resolved.get("scope_eligible_spus", len(resolved["selected_spus"])),
+                "scope_excluded_spus": resolved.get("scope_excluded_spus", 0),
+                "scope_min_weeks": DEFAULT_SCOPE_MIN_WEEKS,
+            }
+            self._append_log(
+                run_id,
+                "info",
+                f"Selection resolved: {resolved['count']} SPUs selected.",
+            )
             df_all = get_data_from_db(self.db_url)
             if df_all.empty:
                 raise RuntimeError("No source data was returned from the database.")
@@ -261,7 +258,7 @@ class ForecastRuntimeManager:
             df_all["date"] = pd.to_datetime(df_all["date"], format="mixed")
             df_all["spu"] = df_all["spu"].astype(str)
             df_all["sku"] = df_all["sku"].astype(str)
-            selected_spus = run["selected_spus"] or sorted(df_all["spu"].unique().tolist())
+            selected_spus = resolved["selected_spus"] or sorted(df_all["spu"].unique().tolist())
             if selected_spus:
                 df_all = df_all[df_all["spu"].isin(selected_spus)].copy()
             spus = sorted(df_all["spu"].unique().tolist())
@@ -286,20 +283,19 @@ class ForecastRuntimeManager:
                 )
                 self.store.upsert_run_spu(run_id, spu, "running", message="Processing")
                 self._append_log(run_id, "info", f"Processing SPU {spu} ({index}/{total_spus}).")
+                self._append_log(run_id, "info", f"[SPU {spu}] 模型竞赛准备开始。")
                 df_spu = df_all[df_all["spu"] == spu].copy()
-                spu_log_stream = _RunLogStream(
-                    lambda line, current_spu=spu: self._append_log(run_id, "info", f"[SPU {current_spu}] {line}")
+                result_df, message, _viz, _profile = process_single_spu(
+                    spu,
+                    df_spu,
+                    mode=run["mode"],
+                    exog_cols=exog_cols,
+                    collect_viz=False,
+                    verbose=False,
+                    log_fn=lambda line, current_spu=spu: self._append_log(
+                        run_id, "info", f"[SPU {current_spu}] {line}"
+                    ),
                 )
-                with redirect_stdout(spu_log_stream), redirect_stderr(spu_log_stream):
-                    result_df, message, _viz, _profile = process_single_spu(
-                        spu,
-                        df_spu,
-                        mode=run["mode"],
-                        exog_cols=exog_cols,
-                        collect_viz=False,
-                        verbose=False,
-                    )
-                spu_log_stream.flush()
                 if result_df is not None:
                     all_results.append(result_df)
                     successful += 1

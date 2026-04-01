@@ -1,4 +1,4 @@
-def test_execution_bridge_reexports_kernel_api(monkeypatch):
+﻿def test_execution_bridge_reexports_kernel_api(monkeypatch):
     import src.forecasting.execution_bridge as bridge
 
     monkeypatch.setattr(bridge.forecast_kernel, "get_data_from_db", lambda db_url: f"bridge:{db_url}")
@@ -38,6 +38,44 @@ def test_runtime_uses_execution_bridge(monkeypatch, tmp_path):
     assert total == 3
 
 
+def test_runtime_create_run_is_non_blocking(monkeypatch, tmp_path):
+    import src.api.runtime as runtime_module
+    from src.api.platform_store import PlatformStore
+
+    store = PlatformStore(str(tmp_path / "platform_state.db"))
+    manager = runtime_module.ForecastRuntimeManager(store=store, db_url="sqlite:///demo")
+
+    called = {"resolve": 0, "thread_started": False}
+
+    def boom(*args, **kwargs):
+        called["resolve"] += 1
+        raise AssertionError("resolve_selection should not be called inline")
+
+    class DummyThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            called["thread_started"] = True
+
+    monkeypatch.setattr(manager, "resolve_selection", boom)
+    monkeypatch.setattr(runtime_module.threading, "Thread", DummyThread)
+
+    run = manager.create_run(
+        mode="smart",
+        selection_type="all",
+        selection_payload={},
+        config_id=None,
+    )
+
+    assert called["resolve"] == 0
+    assert called["thread_started"] is True
+    assert run["status"] == "queued"
+    assert run["selected_spus"] == []
+
+
 def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
     import pandas as pd
     import src.api.runtime as runtime_module
@@ -53,8 +91,11 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
     )
 
     def stub_process_single_spu(spu, df_spu, **kwargs):
-        print("运行 Prophet...")
-        print("Prophet: WMAPE=12.34%")
+        log_fn = kwargs.get("log_fn")
+        if log_fn is not None:
+            log_fn("SPU001 model competition starting, train=6 weeks, test=2 weeks.")
+            log_fn("SPU001 | 运行 Prophet...")
+            log_fn("SPU001 | Prophet: WMAPE=12.34%")
         result_df = pd.DataFrame(
             {
                 "spu": [spu],
@@ -87,5 +128,6 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
 
     logs = store.get_logs(run["id"], limit=50)
     messages = [row["message"] for row in logs]
-    assert any("[SPU SPU001] 运行 Prophet..." in message for message in messages)
-    assert any("[SPU SPU001] Prophet: WMAPE=12.34%" in message for message in messages)
+    assert any("[SPU SPU001] SPU001 model competition starting, train=6 weeks, test=2 weeks." in message for message in messages)
+    assert any("[SPU SPU001] SPU001 | 运行 Prophet..." in message for message in messages)
+    assert any("[SPU SPU001] SPU001 | Prophet: WMAPE=12.34%" in message for message in messages)

@@ -43,7 +43,7 @@ function setStartButtonBusy(isBusy, label = "启动任务") {
 }
 
 function focusTaskStatus() {
-  el("runBadge")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  el("logList")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function renderLogs(logs, emptyText = "暂无可展示日志") {
@@ -82,6 +82,7 @@ function pushClientLog(message, level = "info") {
   const container = el("logList");
   if (container) {
     container.innerHTML = renderLogs(state.clientLogs, "当前暂无可展示日志");
+    container.scrollTop = 0;
   }
 }
 
@@ -205,16 +206,12 @@ async function startRun() {
   state.startingRun = true;
   setStartButtonBusy(true);
   const pendingMessage = state.selectionType === "all"
-    ? "正在解析全量 SPU 范围并提交任务，这一步可能需要几十秒。"
+    ? "任务正在提交，后台会先解析全量 SPU 范围。"
     : "任务正在提交，日志区会自动刷新。";
   setRunFeedback(pendingMessage, "info");
   startPendingClientLogs(pendingMessage);
   focusTaskStatus();
   try {
-    if (!state.resolvedSelection || state.resolvedSelection.selection_type !== state.selectionType) {
-      await resolveSelection();
-      pushClientLog(`范围解析完成，共 ${state.resolvedSelection?.count || 0} 个 SPU。`, "info");
-    }
     const result = await api("/api/forecast-jobs", {
       method: "POST",
       body: JSON.stringify({
@@ -225,7 +222,7 @@ async function startRun() {
     clearPendingClientLogs();
     state.currentRunId = result.run_id;
     updateRunHeader(result.run);
-    setRunFeedback("任务已启动，正在等待运行日志。", "success");
+    setRunFeedback("任务已启动，日志会持续刷新。", "success");
     pushClientLog(`任务已创建，运行编号 ${result.run_id.slice(0, 8)}。`, "info");
     await loadRunStatus();
     startPolling();
@@ -369,6 +366,7 @@ function renderNextRunText(nextSchedule) {
 async function loadLinuxOps() {
   const ops = await api("/api/linux-ops");
   state.linuxOps = ops;
+  logs = ops?.logs?.entries || [];
   el("linuxOpsSummary").textContent = ops.captured_at ? `更新于 ${ops.captured_at}` : "已刷新";
   el("linuxLogSourceValue").textContent = ops.logs?.source?.label || "服务日志";
   el("linuxNextRunValue").textContent = renderNextRunText(ops.next_schedule);
@@ -382,10 +380,27 @@ async function loadLinuxOps() {
 }
 
 async function loadExecutionLogs() {
-  const ops = state.linuxOps || await api("/api/linux-ops");
-  state.linuxOps = ops;
-  const logs = ops?.logs?.entries || [];
   const container = el("logList");
+  let ops = state.linuxOps;
+  let logs = [];
+  if (state.currentRunId) {
+    try {
+      logs = await api(`/api/forecast-jobs/${state.currentRunId}/logs?limit=200`);
+    } catch (error) {
+      console.warn("Failed to load run logs", error);
+    }
+  }
+  if (logs.length) {
+    el("linuxLogSourceValue").textContent = `任务 ${state.currentRunId.slice(0, 8)}`;
+    el("linuxOpsSummary").textContent = "日志来源：当前运行任务";
+    el("liveLogHint").textContent = "当前显示：任务实时日志";
+    const mergedLogs = [...state.clientLogs, ...logs].slice(0, 120);
+    container.innerHTML = renderLogs(mergedLogs);
+    container.scrollTop = container.scrollHeight;
+    return;
+  }
+  ops = ops || await api("/api/linux-ops");
+  state.linuxOps = ops;
   el("linuxLogSourceValue").textContent = ops?.logs?.source?.label || "服务日志";
   const sourceParts = [];
   if (ops?.logs?.source?.kind) sourceParts.push(ops.logs.source.kind);
@@ -488,7 +503,7 @@ async function runConfig(configId) {
     const result = await api(`/api/forecast-configs/${configId}/run`, { method: "POST" });
     state.currentRunId = result.run_id;
     updateRunHeader(result.run);
-    setRunFeedback("模板任务已启动，正在等待运行日志。", "success");
+    setRunFeedback("模板任务已启动，日志会持续刷新。", "success");
     await loadRunStatus();
     startPolling();
   } finally {
