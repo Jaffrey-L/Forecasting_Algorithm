@@ -5,6 +5,7 @@ const state = {
   pollingTimer: null,
   configs: [],
   resultLoadedFor: null,
+  linuxOps: null,
 };
 
 const selectionHelp = {
@@ -15,6 +16,15 @@ const selectionHelp = {
 
 function el(id) {
   return document.getElementById(id);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function renderPills(containerId, values, emptyText = "暂无数据") {
@@ -146,11 +156,25 @@ async function stopRun() {
 
 async function loadRunStatus() {
   const runs = await api("/api/forecast-jobs?limit=1");
-  if (!runs.length) return;
+  if (!runs.length) {
+    state.currentRunId = null;
+    setRunStatus({ status: "idle" });
+    el("progressValue").textContent = "0%";
+    el("processedValue").textContent = "0 / 0";
+    el("successValue").textContent = "0";
+    el("currentSpuValue").textContent = "-";
+    el("progressBar").style.width = "0%";
+    el("heroLastRun").textContent = "鏆傛棤";
+    el("stopJobBtn").classList.add("hidden");
+    await loadLinuxOps();
+    await loadExecutionLogs();
+    return;
+  }
   const run = runs[0];
   state.currentRunId = run.id;
   updateRunHeader(run);
-  await Promise.all([loadRunSpus(), loadRunLogs()]);
+  await Promise.all([loadRunSpus(), loadLinuxOps()]);
+  await loadExecutionLogs();
   if (!["queued", "running", "stopping"].includes(run.status) && state.pollingTimer) {
     clearInterval(state.pollingTimer);
     state.pollingTimer = null;
@@ -196,6 +220,75 @@ async function loadRunLogs() {
   container.innerHTML = logs.map((log) => {
     const css = log.level === "error" ? "log-entry error" : "log-entry";
     return `<div class="${css}"><span class="log-time">${log.created_at}</span>${log.message}</div>`;
+  }).join("");
+  container.scrollTop = container.scrollHeight;
+}
+
+function renderSystemdStatus(service) {
+  const stateText = service.status_text || `${service.active_state || "unknown"} / ${service.sub_state || "unknown"}`;
+  const statusClass =
+    service.active_state === "active"
+      ? "status-running"
+      : service.active_state === "inactive"
+        ? "status-idle"
+        : service.available === false
+          ? "status-failed"
+          : "status-stopped";
+  return `
+    <article class="stack-item">
+      <div class="preview-topline">
+        <strong>${escapeHtml(service.description || service.unit)}</strong>
+        <span class="status ${statusClass}">${escapeHtml(service.active_state || "unknown")}</span>
+      </div>
+      <p>单位：${escapeHtml(service.unit || "-")}</p>
+      <p>状态：${escapeHtml(stateText)}</p>
+      <p>启用：${escapeHtml(service.unit_file_state || "-")}</p>
+      <p>下次触发：${escapeHtml(service.next_elapse_realtime || "n/a")}</p>
+      <p>日志：${escapeHtml(service.log_path || "n/a")}</p>
+    </article>
+  `;
+}
+
+function renderNextRunText(nextSchedule) {
+  if (!nextSchedule) return "暂无启用的定期执行";
+  return `${nextSchedule.config_name} · ${nextSchedule.next_run_text}`;
+}
+
+async function loadLinuxOps() {
+  const ops = await api("/api/linux-ops");
+  state.linuxOps = ops;
+  el("linuxOpsSummary").textContent = ops.captured_at ? `更新于 ${ops.captured_at}` : "已刷新";
+  el("linuxLogSourceValue").textContent = ops.logs?.source?.label || "服务日志";
+  el("linuxNextRunValue").textContent = renderNextRunText(ops.next_schedule);
+  const services = ops.services || [];
+  const container = el("linuxServiceList");
+  if (!services.length) {
+    container.innerHTML = `<div class="stack-item muted">暂无系统服务状态</div>`;
+    return;
+  }
+  container.innerHTML = services.map(renderSystemdStatus).join("");
+}
+
+async function loadExecutionLogs() {
+  const ops = state.linuxOps || await api("/api/linux-ops");
+  state.linuxOps = ops;
+  const logs = ops?.logs?.entries || [];
+  const container = el("logList");
+  el("linuxLogSourceValue").textContent = ops?.logs?.source?.label || "服务日志";
+  const sourceParts = [];
+  if (ops?.logs?.source?.kind) sourceParts.push(ops.logs.source.kind);
+  if (ops?.logs?.source?.status) sourceParts.push(ops.logs.source.status);
+  if (ops?.logs?.source?.run_id) sourceParts.push(ops.logs.source.run_id.slice(0, 8));
+  el("linuxOpsSummary").textContent = sourceParts.length ? `日志来源：${sourceParts.join(" / ")}` : "日志来源已更新";
+  if (!logs.length) {
+    container.innerHTML = `<div class="log-entry">暂无可展示日志</div>`;
+    return;
+  }
+  container.innerHTML = logs.map((log) => {
+    const css = log.level === "error" ? "log-entry error" : "log-entry";
+    const prefix = [log.source, log.timestamp].filter(Boolean).join(" | ");
+    const head = prefix ? `<span class="log-time">${escapeHtml(prefix)}</span>` : "";
+    return `<div class="${css}">${head}${escapeHtml(log.message)}</div>`;
   }).join("");
   container.scrollTop = container.scrollHeight;
 }
@@ -315,6 +408,7 @@ async function loadSchedules() {
       <h4>${configMap[schedule.config_id]?.name || schedule.config_id}</h4>
       <p>${weekdays[schedule.weekday]} ${String(schedule.hour).padStart(2, "0")}:${String(schedule.minute).padStart(2, "0")}</p>
       <p>时区：${schedule.timezone} | 状态：${schedule.enabled ? "启用" : "停用"}</p>
+      <p>下次执行：${schedule.next_run_text || "暂无"}</p>
     </article>
   `).join("");
 }
@@ -327,7 +421,22 @@ function bindEvents() {
   el("startJobBtn").addEventListener("click", () => startRun().catch(handleError));
   el("stopJobBtn").addEventListener("click", () => stopRun().catch(handleError));
   el("loadResultsBtn").addEventListener("click", () => loadResults().catch(handleError));
-  el("refreshLogsBtn").addEventListener("click", () => loadRunLogs().catch(handleError));
+  el("refreshLogsBtn").addEventListener("click", async () => {
+    try {
+      await loadLinuxOps();
+      await loadExecutionLogs();
+    } catch (error) {
+      handleError(error);
+    }
+  });
+  el("refreshLinuxOpsBtn").addEventListener("click", async () => {
+    try {
+      await loadLinuxOps();
+      await loadExecutionLogs();
+    } catch (error) {
+      handleError(error);
+    }
+  });
   el("saveConfigBtn").addEventListener("click", () => saveConfig().catch(handleError));
   el("refreshConfigsBtn").addEventListener("click", async () => {
     try {
@@ -348,7 +457,7 @@ async function bootstrap() {
   bindEvents();
   setSelectionType("all");
   updateResultKpis(null);
-  await Promise.all([loadConfigs(), loadSchedules(), loadRunStatus()]);
+  await Promise.all([loadConfigs(), loadSchedules(), loadRunStatus(), loadLinuxOps()]);
   if (state.currentRunId) {
     startPolling();
   }

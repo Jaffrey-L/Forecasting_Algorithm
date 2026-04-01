@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import json
 from sqlalchemy import create_engine, text
-from config_and_utils import build_future_exog_frame
+from src.forecasting.runtime_facade import build_future_exog_frame
 from src.forecasting.predictors import *
 from src.database.repositories import *
 from src.utils.helpers import *

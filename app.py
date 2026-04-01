@@ -1,3 +1,9 @@
+"""Legacy Flask compatibility entrypoint.
+
+The active platform entrypoint is ``src.api.app``. This module is kept only as
+an importable/runable compatibility surface for older local workflows.
+"""
+
 from flask import Flask, render_template, jsonify, request, send_from_directory
 import threading
 import time
@@ -7,11 +13,19 @@ import os
 import sys
 import pandas as pd
 from sqlalchemy import create_engine, text
+from src.forecasting.execution_bridge import get_data_from_db, process_single_spu, save_to_database
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
+app.config["PRIMARY_ENTRYPOINT"] = "src.api.app"
+app.config["LEGACY_COMPATIBILITY_ENTRYPOINT"] = True
+
+LEGACY_ENTRYPOINT_MESSAGE = (
+    "Legacy Flask compatibility entrypoint. Use 'uvicorn src.api.app:app' "
+    "for the primary platform API."
+)
 
 # 预测状态
 forecast_status = {
@@ -127,9 +141,6 @@ def run_forecast_simulation():
     add_log("=" * 70)
     
     try:
-        # 导入main.py中的函数
-        from main import get_data_from_db, process_single_spu, save_to_database
-        
         # 获取数据
         add_log("正在从数据库获取数据...")
         df_all = get_data_from_db(DB_URL)
@@ -343,6 +354,8 @@ if __name__ == '__main__':
     # 创建logs目录
     os.makedirs('logs', exist_ok=True)
     
-    print("启动SPU销售预测系统...")
-    print("请访问: http://localhost:5000")
+    print("启动SPU销售预测系统（兼容入口）...")
+    print(LEGACY_ENTRYPOINT_MESSAGE)
+    print("Legacy URL: http://localhost:5000")
+    print("Primary API: uvicorn src.api.app:app --host 0.0.0.0 --port 8000")
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from src.api.platform_store import PlatformStore, utcnow_iso
 from src.database.repositories import get_database_engine, query_forecast_results, save_to_database
+from src.forecasting.execution_bridge import get_data_from_db, process_single_spu
 
 
 TOKEN_SPLIT_RE = re.compile(r"[\s,;|\r\n\t]+")
@@ -179,8 +180,6 @@ class ForecastRuntimeManager:
         return eligible_spus
 
     def _load_all_spus_with_scope(self) -> tuple[List[str], int]:
-        from main import get_data_from_db
-
         df = get_data_from_db(self.db_url)
         if df.empty:
             return [], 0
@@ -207,8 +206,6 @@ class ForecastRuntimeManager:
         return sorted(eligible_spus), len(all_spus)
 
     def _execute_run(self, run_id: str, stop_event: threading.Event) -> None:
-        from main import get_data_from_db, process_single_spu
-
         run = self.store.get_run(run_id)
         if not run:
             return

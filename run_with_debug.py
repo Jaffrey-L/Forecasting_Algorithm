@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import datetime
 import pandas as pd
-from src.forecasting.main import main
+from src.forecasting.execution_bridge import main
 
 def run_with_debug():
     """运行预测并添加详细调试信息"""

@@ -30,6 +30,35 @@ def test_fastapi_app_has_platform_routes():
     assert "/api/forecast-jobs" in paths
     assert "/api/forecast-configs" in paths
     assert "/api/forecast-schedules" in paths
+    assert "/api/linux-ops" in paths
+
+
+def test_linux_ops_api_uses_snapshot_helper(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import src.api.app as app_module
+    from src.api.platform_store import PlatformStore
+
+    original_store = app_module.store
+    monkeypatch.setattr(app_module, "store", PlatformStore(str(tmp_path / "platform_state.db")))
+
+    def stub_snapshot(store, current_run=None, **kwargs):
+        return {
+            "captured_at": "2026-04-01T00:00:00Z",
+            "current_run": None,
+            "services": [],
+            "next_schedule": None,
+            "schedules": [],
+            "logs": {"source": {"kind": "service", "label": "服务日志"}, "entries": []},
+        }
+
+    monkeypatch.setattr(app_module, "collect_linux_ops_snapshot", stub_snapshot)
+
+    client = TestClient(app_module.app)
+    response = client.get("/api/linux-ops")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["logs"]["source"]["label"] == "服务日志"
+    monkeypatch.setattr(app_module, "store", original_store)
 
 
 def test_frontend_entry_returns_new_console_markup():
@@ -41,6 +70,37 @@ def test_frontend_entry_returns_new_console_markup():
     assert response.status_code == 200
     assert "Overview" in response.text
     assert "mode-switch" in response.text
+    assert 'data-mode="smart-only"' in response.text
+
+
+def test_compatibility_analysis_status_idle_state(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import src.api.app as app_module
+    from src.api.platform_store import PlatformStore
+
+    original_store = app_module.store
+    monkeypatch.setattr(app_module, "store", PlatformStore(str(tmp_path / "platform_state.db")))
+
+    client = TestClient(app_module.app)
+    response = client.get("/api/analysis-status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] is None
+    assert payload["status"] == "idle"
+    assert payload["progress"] == 0
+    assert payload["processed_count"] == 0
+    assert payload["total_count"] == 0
+    assert payload["success_count"] == 0
+    assert payload["current_spu"] is None
+    assert payload["mode"] == "smart"
+    assert payload["trigger_source"] is None
+    assert payload["scope_min_weeks"] == 108
+    assert payload["scope_total_spus"] == 0
+    assert payload["scope_eligible_spus"] == 0
+    assert payload["scope_excluded_spus"] == 0
+
+    monkeypatch.setattr(app_module, "store", original_store)
 
 
 def test_manual_selection_api_returns_preview():
@@ -244,6 +304,7 @@ def test_results_api_with_stubbed_manager(monkeypatch):
     class StubManager:
         def get_results(self, **filters):
             assert filters["run_id"] == "run_123"
+            assert filters["limit"] == 25
             return [
                 {
                     "spu": "SPU001",
@@ -259,7 +320,7 @@ def test_results_api_with_stubbed_manager(monkeypatch):
 
     monkeypatch.setattr(app_module, "manager", StubManager())
     client = TestClient(app_module.app)
-    response = client.get("/api/forecast-results?run_id=run_123")
+    response = client.get("/api/forecast-results", params={"run_id": "run_123", "limit": 25})
     assert response.status_code == 200
     payload = response.json()
     assert payload[0]["spu"] == "SPU001"

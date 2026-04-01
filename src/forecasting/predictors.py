@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import pmdarima as pm
+import json
 from prophet import Prophet
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import Ridge
@@ -11,6 +12,16 @@ import time
 import random
 from functools import partial
 from src.forecasting.models import *
+
+forecast_kernel = None
+
+
+def _get_forecast_kernel():
+    if forecast_kernel is not None:
+        return forecast_kernel
+    from src.forecasting import kernel as loaded_kernel
+
+    return loaded_kernel
 
 
 def clean_series(series):
@@ -284,6 +295,66 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
     print("=" * 70)
     
     return models, base_results
+
+
+def calculate_dynamic_shares(df_spu_idx, spu, spu_sales_weekly, future_dates):
+    return _get_forecast_kernel().calculate_dynamic_shares(df_spu_idx, spu, spu_sales_weekly, future_dates)
+
+
+def process_single_spu(spu, df_all, mode='smart', exog_cols=None, collect_viz=False, verbose=True):
+    result_df, message, _viz, profile = _get_forecast_kernel().process_single_spu(
+        spu,
+        df_all,
+        mode=mode,
+        exog_cols=exog_cols,
+        collect_viz=collect_viz,
+        verbose=verbose,
+    )
+    error = None if result_df is not None else message
+    return result_df, error, profile
+
+
+def calculate_spu_accuracy(actual, pred):
+    actual_series = pd.Series(actual)
+    pred_series = pd.Series(pred).reindex(actual_series.index)
+    errors = actual_series - pred_series
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(np.square(errors))))
+    non_zero = actual_series.replace(0, np.nan)
+    mape = float(np.nanmean(np.abs(errors) / non_zero)) if non_zero.notna().any() else 0.0
+    return {
+        'wmape': float(calculate_wmape(actual_series, pred_series)),
+        'mape': 0.0 if np.isnan(mape) else mape,
+        'mae': mae,
+        'rmse': rmse,
+    }
+
+
+def calculate_sku_accuracy(actual, pred):
+    actual_df = pd.DataFrame(actual)
+    pred_df = pd.DataFrame(pred).reindex(index=actual_df.index, columns=actual_df.columns, fill_value=0)
+    sku_metrics = {}
+    total_actual = float(actual_df.to_numpy().sum())
+    weighted_error = 0.0
+
+    for sku in actual_df.columns:
+        sku_actual = actual_df[sku]
+        sku_pred = pred_df[sku]
+        wmape = float(calculate_wmape(sku_actual, sku_pred))
+        total_sales = float(sku_actual.sum())
+        weight = (total_sales / total_actual) if total_actual > 0 else 0.0
+        weighted_error += wmape * weight
+        sku_metrics[sku] = {
+            'wmape': wmape,
+            'total_sales': total_sales,
+            'weight_in_spu': weight,
+        }
+
+    return {
+        'wmape': weighted_error,
+        'sku_metrics': sku_metrics,
+        'sku_accuracy_json': json.dumps(sku_metrics, ensure_ascii=False),
+    }
 
 
 def predict_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None):

@@ -122,6 +122,27 @@
             </section>
 
             <section class="panel span-full">
+                <div class="panel-header compact">
+                    <h2>Linux 运维状态</h2>
+                    <div class="actions">
+                        <span id="linuxOpsSummary" class="muted">等待刷新</span>
+                        <button id="refreshLinuxOpsBtn" class="btn btn-ghost">刷新运维状态</button>
+                    </div>
+                </div>
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <span class="muted">当前日志来源</span>
+                        <strong id="linuxLogSourceValue">-</strong>
+                    </div>
+                    <div class="summary-item">
+                        <span class="muted">下次定期执行</span>
+                        <strong id="linuxNextRunValue">-</strong>
+                    </div>
+                </div>
+                <div id="linuxServiceList" class="stack-list top-gap"></div>
+            </section>
+
+            <section class="panel span-full">
                 <div class="result-panel">
                     <div class="panel-header compact">
                         <h2>预测结果</h2>

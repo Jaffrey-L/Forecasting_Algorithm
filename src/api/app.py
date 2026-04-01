@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.api.platform_store import PlatformStore
+from src.api.linux_ops import ACTIVE_RUN_STATUSES, build_schedule_overview, collect_linux_ops_snapshot
 from src.api.runtime import DEFAULT_SCOPE_MIN_WEEKS, ForecastRuntimeManager, VALID_MODES
 
 
@@ -165,6 +166,13 @@ def _preferred_run(run_id: Optional[str] = None):
             if run["status"] == preferred_status:
                 return run
     return runs[0] if runs else None
+
+
+def _preferred_active_run(run_id: Optional[str] = None):
+    run = _preferred_run(run_id)
+    if run and run.get("status") in ACTIVE_RUN_STATUSES:
+        return run
+    return None
 
 
 def _legacy_status_payload(run: Optional[dict[str, Any]]):
@@ -394,7 +402,12 @@ async def upsert_forecast_schedule(request: ScheduleUpsertRequest):
 
 @app.get("/api/forecast-schedules")
 async def list_forecast_schedules():
-    return store.list_schedules()
+    return build_schedule_overview(store)["schedules"]
+
+
+@app.get("/api/linux-ops")
+async def get_linux_ops(run_id: Optional[str] = None):
+    return collect_linux_ops_snapshot(store, current_run=_preferred_active_run(run_id))
 
 
 @app.get("/api/weekly-schedule")

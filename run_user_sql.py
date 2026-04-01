@@ -13,6 +13,7 @@ import time
 import pandas as pd
 from sqlalchemy import create_engine, text
 from src.database.repositories import save_to_database
+from src.forecasting.execution_bridge import process_single_spu
 
 def get_user_data(db_url):
     """使用用户提供的SQL获取数据"""
@@ -150,9 +151,6 @@ def run_user_sql():
     # 简单测试：只处理一个SPU
     spus = df_all['spu'].unique()[:1]
     print(f"\n🔄 只处理第一个SPU: {spus[0]}")
-    
-    # 导入处理函数
-    from src.forecasting.main import process_single_spu
     
     exog_cols = [c for c in df_all.columns if c in ['ad_cost', 'price']]
     if exog_cols:

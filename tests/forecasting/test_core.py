@@ -6,6 +6,7 @@ import pytest
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from types import SimpleNamespace
 
 
 class TestCoreFunctions:
@@ -100,41 +101,78 @@ class TestCoreFunctions:
                         index=pd.date_range('2026-01-01', periods=10, freq='W'))
         
         # 运行模型
-        results = run_all_models(train, test, mode='smart', verbose=False)
+        results, base_results = run_all_models(train, test, mode='smart', verbose=False)
         
         # 验证结果
         assert isinstance(results, list)
         assert len(results) > 0
+        assert isinstance(base_results, dict)
         
         # 验证每个结果
         for result in results:
-            assert 'algo' in result
+            assert 'name' in result
             assert 'wmape' in result
-            assert 'forecast' in result
-            assert 'params' in result
+            assert 'preds' in result
     
     def test_process_single_spu_basic(self):
         """测试单个SPU处理"""
-        from src.forecasting.predictors import process_single_spu
-        
-        # 准备测试数据
-        dates = pd.date_range('2025-01-01', periods=100, freq='W')
-        data = {
-            'date': dates,
-            'spu': ['SPU001'] * 100,
-            'sales': np.random.randint(100, 1000, 100),
-            'sku': ['SKU001', 'SKU002', 'SKU003'] * 33 + ['SKU001']
-        }
-        df_all = pd.DataFrame(data)
-        
-        # 处理SPU
-        result, error, profile = process_single_spu('SPU001', df_all, verbose=False)
-        
-        # 验证结果
+        from src.forecasting import predictors
+
+        fake_profile = object()
+        fake_kernel = SimpleNamespace()
+
+        def fake_process_single_spu(*args, **kwargs):
+            return pd.DataFrame({"winner_algo": ["FakeModel"]}), "ignored", None, fake_profile
+
+        fake_kernel.process_single_spu = fake_process_single_spu
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(predictors, "forecast_kernel", fake_kernel, raising=False)
+        try:
+            df_all = pd.DataFrame(
+                {
+                    "date": pd.date_range("2025-01-01", periods=20, freq="W"),
+                    "spu": ["SPU001"] * 20,
+                    "sales": np.random.randint(100, 1000, 20),
+                    "sku": ["SKU001"] * 20,
+                }
+            )
+
+            result, error, profile = predictors.process_single_spu("SPU001", df_all, verbose=False)
+
+            assert result is not None
+            assert error is None
+            assert profile is fake_profile
+        finally:
+            monkeypatch.undo()
+
+    def test_process_single_spu_uses_kernel_alias(self, monkeypatch):
+        """测试预测器层只通过 kernel 走单个 SPU 处理"""
+        from src.forecasting import predictors
+
+        fake_profile = object()
+        fake_kernel = SimpleNamespace()
+
+        def fake_process_single_spu(*args, **kwargs):
+            return pd.DataFrame({"winner_algo": ["FakeModel"]}), "ignored", None, fake_profile
+
+        fake_kernel.process_single_spu = fake_process_single_spu
+        monkeypatch.setattr(predictors, "forecast_kernel", fake_kernel, raising=False)
+
+        df_all = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=20, freq="W"),
+                "spu": ["SPU001"] * 20,
+                "sales": np.arange(1, 21),
+                "sku": ["SKU001"] * 20,
+            }
+        )
+
+        result, error, profile = predictors.process_single_spu("SPU001", df_all, verbose=False)
+
         assert result is not None
         assert error is None
-        assert profile is not None
-    
+        assert profile is fake_profile
+
     def test_calculate_dynamic_shares_basic(self):
         """测试动态份额计算"""
         from src.forecasting.predictors import calculate_dynamic_shares
@@ -142,12 +180,12 @@ class TestCoreFunctions:
         # 准备测试数据
         dates = pd.date_range('2025-01-01', periods=100, freq='W')
         data = {
-            'date': dates * 3,
+            'date': np.tile(dates, 3),
             'spu': ['SPU001'] * 300,
             'sku': ['SKU001', 'SKU002', 'SKU003'] * 100,
             'sales': np.random.randint(10, 100, 300)
         }
-        df_spu_idx = pd.DataFrame(data)
+        df_spu_idx = pd.DataFrame(data).set_index('date')
         spu = 'SPU001'
         spu_sales = pd.Series(np.random.randint(100, 1000, 100), 
                              index=pd.date_range('2025-01-01', periods=100, freq='W'))

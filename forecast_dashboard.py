@@ -176,7 +176,7 @@ def run_real_forecast():
     try:
         # 添加路径
         sys.path.insert(0, '.')
-        from src.forecasting.main import main as forecast_main
+        from src.forecasting.execution_bridge import main as forecast_main
         
         # 重定向输出到日志
         class LogCapture:

@@ -22,11 +22,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 print(f"WORKER_PATH: 项目路径已添加: {sys.path[0]}", flush=True)
 
 try:
-    print("WORKER_IMPORT: 开始导入main模块...", flush=True)
-    from main import get_data_from_db, process_single_spu, save_to_database
-    print("WORKER_IMPORT: main模块导入成功", flush=True)
+    print("WORKER_IMPORT: 开始导入执行桥接模块...", flush=True)
+    from src.forecasting.execution_bridge import get_data_from_db, process_single_spu, save_to_database
+    print("WORKER_IMPORT: 执行桥接模块导入成功", flush=True)
 except Exception as e:
-    print(f"WORKER_ERROR: main模块导入失败: {str(e)}", flush=True)
+    print(f"WORKER_ERROR: 执行桥接模块导入失败: {str(e)}", flush=True)
     import traceback
     print(traceback.format_exc(), flush=True)
     sys.exit(1)

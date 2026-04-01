@@ -10,8 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import datetime
 import pandas as pd
-from src.forecasting.main import get_data_from_db, process_single_spu
-from src.database.repositories import save_to_database
+from src.forecasting.execution_bridge import get_data_from_db, process_single_spu, save_to_database
 
 def run_simple_forecast():
     """运行简化版预测"""

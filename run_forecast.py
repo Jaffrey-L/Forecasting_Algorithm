@@ -182,7 +182,7 @@ def main():
         try:
             # 添加路径
             sys.path.insert(0, '.')
-            from src.forecasting.main import main as forecast_main
+            from src.forecasting.execution_bridge import main as forecast_main
             
             logs.append("导入main模块成功")
             logs.append("开始执行main函数...")

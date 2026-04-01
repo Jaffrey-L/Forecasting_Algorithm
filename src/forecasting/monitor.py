@@ -36,14 +36,20 @@ class ForecastingMonitor:
         """
         self.db_url = db_url
         self.wmape_threshold = wmape_threshold
-        self.engine = create_engine(db_url)
+        self._engine = None
         logger.info(f"ForecastingMonitor initialized with WMAPE threshold: {wmape_threshold}")
-    
+
     def __del__(self):
         """清理资源"""
-        if hasattr(self, 'engine'):
-            self.engine.dispose()
+        if getattr(self, '_engine', None) is not None:
+            self._engine.dispose()
             logger.info("Database engine disposed")
+
+    @property
+    def engine(self):
+        if self._engine is None:
+            self._engine = create_engine(self.db_url)
+        return self._engine
     
     def load_forecast_history(self, days: int = 30) -> pd.DataFrame:
         """
@@ -55,7 +61,7 @@ class ForecastingMonitor:
         Returns:
             pd.DataFrame: 预测历史数据
         """
-        query = """
+        query = text("""
         SELECT 
             spu,
             run_date,
@@ -68,13 +74,18 @@ class ForecastingMonitor:
             training_weeks,
             data_end_date
         FROM finedatalink.sales_forecast_history
-        WHERE run_date >= (CURRENT_DATE - INTERVAL '%s days')
+        WHERE run_date >= (CURRENT_DATE - (:days * INTERVAL '1 day'))
         ORDER BY run_date DESC, spu
-        """
+        """)
         
         try:
             with self.engine.connect() as conn:
-                df = pd.read_sql_query(query, conn, params=(days,))
+                result = conn.execute(query, {"days": days})
+                if isinstance(result, pd.DataFrame):
+                    df = result.copy()
+                else:
+                    rows = result.mappings().all()
+                    df = pd.DataFrame(rows)
             logger.info(f"Loaded {len(df)} forecast records from last {days} days")
             return df
         except Exception as e:
@@ -120,7 +131,8 @@ class ForecastingMonitor:
         # 按日期统计
         for date in df['run_date'].unique():
             date_data = df[df['run_date'] == date]
-            stats['by_date'][str(date)] = {
+            date_key = str(pd.Timestamp(date).date())
+            stats['by_date'][date_key] = {
                 'count': len(date_data),
                 'mean_wmape': date_data['validation_wmape'].mean(),
                 'threshold_exceeded': (date_data['validation_wmape'] > self.wmape_threshold).sum()
@@ -256,11 +268,12 @@ class ForecastingMonitor:
         alerts = []
         
         for anomaly in anomalies:
+            run_date = pd.Timestamp(anomaly['run_date'])
             alert = {
-                'alert_id': f"ALERT_{anomaly['type']}_{anomaly['spu']}_{anomaly['run_date']}",
+                'alert_id': f"ALERT_{anomaly['type']}_{anomaly['spu']}_{run_date.date()}",
                 'alert_type': anomaly['type'],
                 'spu': anomaly['spu'],
-                'run_date': anomaly['run_date'],
+                'run_date': run_date,
                 'severity': 'HIGH' if 'THRESHOLD' in anomaly['type'] else 'MEDIUM',
                 'message': anomaly['message'],
                 'created_at': datetime.datetime.now()

@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath('.'))
 
 # 导入预测引擎
 try:
-    from src.forecasting.main import main as run_forecast
+    from src.forecasting.execution_bridge import main as run_forecast
     print("✅ 成功导入预测引擎")
 except Exception as e:
     print(f"❌ 导入预测引擎失败: {e}")
