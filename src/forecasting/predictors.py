@@ -118,20 +118,18 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
     try:
         regime = _infer_model_regime(train, screening)
         df_train = pd.DataFrame({'ds': train.index, 'y': train.values})
-        
-        # 妫€鏌f_train鏄惁涓虹┖
+
         if df_train.empty:
             if verbose:
                 print("Prophet 澶辫触: 璁粌鏁版嵁涓虹┖")
             else:
                 print("Prophet 澶辫触: 璁粌鏁版嵁涓虹┖")
             return None
-            
+
         if train_exog is not None:
-            # 妫€鏌rain_exog鏄惁涓虹┖
             if not train_exog.empty:
-                # 纭繚train_exog鐨勭储寮曚笌train涓€鑷?                train_exog_aligned = train_exog.reindex(train.index)
-                # 鍙坊鍔犲瓨鍦ㄧ殑鍒?                for col in train_exog_aligned.columns:
+                train_exog_aligned = train_exog.reindex(train.index)
+                for col in train_exog_aligned.columns:
                     if not train_exog_aligned[col].isna().all():
                         df_train[col] = train_exog_aligned[col].values
         seasonality_mode = 'multiplicative' if regime["history_weeks"] >= 26 and regime["zero_ratio"] < 0.5 else 'additive'
@@ -151,17 +149,15 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
         if regime["history_weeks"] >= 52:
             model.add_seasonality(name='52w', period=52, fourier_order=5)
         if train_exog is not None:
-            # 妫€鏌rain_exog鏄惁涓虹┖
             if not train_exog.empty:
-                # 鍙坊鍔犲瓨鍦ㄧ殑鍒?                for col in train_exog.columns:
+                for col in train_exog.columns:
                     model.add_regressor(col)
         model.fit(df_train)
         df_test = pd.DataFrame({'ds': test.index})
         if test_exog is not None:
-            # 妫€鏌est_exog鏄惁涓虹┖
             if not test_exog.empty:
-                # 纭繚test_exog鐨勭储寮曚笌test涓€鑷?                test_exog_aligned = test_exog.reindex(test.index)
-                # 鍙坊鍔犲瓨鍦ㄧ殑鍒?                for col in test_exog_aligned.columns:
+                test_exog_aligned = test_exog.reindex(test.index)
+                for col in test_exog_aligned.columns:
                     if not test_exog_aligned[col].isna().all():
                         df_test[col] = test_exog_aligned[col].values
         forecast = model.predict(df_test)
@@ -323,7 +319,7 @@ def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False, 
             stepwise=True
         )
         test_exog_vals = test_exog.values if test_exog is not None else None
-        y_pred, _ = model.predict(n_periods=len(test), exogenous=test_exog_vals, return_conf_int=False)
+        y_pred = model.predict(n_periods=len(test), exogenous=test_exog_vals, return_conf_int=False)
         y_pred = np.maximum(y_pred, 0)
         if regime["zero_heavy"]:
             y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.2, 1.0))
