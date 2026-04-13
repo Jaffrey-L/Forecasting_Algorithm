@@ -136,6 +136,38 @@ def _conservative_model_score(model: dict, test_series: pd.Series) -> float:
     return wmape + 0.35 * zero_mismatch + 0.15 * over_bias + 0.10 * pred_jump
 
 
+def _standard_model_score(model: dict, test_series: pd.Series) -> float:
+    """Lightweight tie-breaker for standard policy.
+
+    Keep WMAPE as dominant signal while penalizing over-forecast and unstable
+    trajectories when top candidates have similar validation errors.
+    """
+    preds = np.asarray(model.get("preds", []), dtype=float).flatten()
+    actual = np.asarray(test_series.values, dtype=float).flatten()
+    n = min(len(preds), len(actual))
+    if n == 0:
+        return float("inf")
+    preds = np.maximum(preds[:n], 0.0)
+    actual = actual[:n]
+
+    wmape = float(model.get("wmape", float("inf")))
+    if not np.isfinite(wmape):
+        wmape = 9.999
+
+    pred_mean = float(np.mean(preds)) if n > 0 else 0.0
+    actual_mean = float(np.mean(actual)) if n > 0 else 0.0
+    over_bias = max(pred_mean - actual_mean, 0.0) / max(actual_mean, 1.0)
+
+    pred_diff = np.diff(preds) if n > 1 else np.array([0.0])
+    pred_jump = float(np.mean(np.abs(pred_diff))) / max(actual_mean, 1.0)
+    pred_zero_ratio = float(np.mean(preds <= 1e-6))
+    actual_zero_ratio = float(np.mean(actual == 0.0))
+    zero_mismatch = abs(pred_zero_ratio - actual_zero_ratio)
+
+    # Lighter than conservative score, used only for close-call decisions.
+    return wmape + 0.12 * over_bias + 0.08 * pred_jump + 0.06 * zero_mismatch
+
+
 def _apply_low_signal_post_rules(preds: np.ndarray, history_series: pd.Series, screening: dict) -> np.ndarray:
     adjusted = np.asarray(preds, dtype=float).flatten().copy()
     if adjusted.size == 0:
@@ -309,7 +341,40 @@ def process_single_spu(
                     )
                     log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
             else:
-                winner = min(valid_results, key=lambda x: x["wmape"])
+                wmape_ranked = sorted(valid_results, key=lambda item: item.get("wmape", float("inf")))
+                winner = wmape_ranked[0]
+                if len(wmape_ranked) >= 2:
+                    runner_up = wmape_ranked[1]
+                    winner_wmape = float(winner.get("wmape", float("inf")))
+                    runner_wmape = float(runner_up.get("wmape", float("inf")))
+                    if np.isfinite(winner_wmape) and np.isfinite(runner_wmape):
+                        wmape_gap = runner_wmape - winner_wmape
+                        # If top models are close, use a stability-aware tie-breaker.
+                        if wmape_gap <= 0.025:
+                            close_candidates = [
+                                candidate
+                                for candidate in wmape_ranked
+                                if float(candidate.get("wmape", 9.999)) - winner_wmape <= 0.025
+                            ]
+                            ranked = sorted(
+                                [
+                                    (
+                                        _standard_model_score(candidate, test),
+                                        candidate,
+                                    )
+                                    for candidate in close_candidates
+                                ],
+                                key=lambda item: item[0],
+                            )
+                            winner = ranked[0][1]
+                            if log_fn is not None:
+                                score_text = ", ".join(
+                                    [
+                                        f"{item[1]['name']}={item[0]:.4f}"
+                                        for item in ranked[:4]
+                                    ]
+                                )
+                                log_fn(f"SPU {spu} standard close-call ranking: {score_text}.")
 
         future_exog = None
         if has_exog and exog_series is not None:

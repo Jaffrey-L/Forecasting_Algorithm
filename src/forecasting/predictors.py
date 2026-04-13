@@ -2,7 +2,10 @@
 import numpy as np
 import pmdarima as pm
 import json
-from prophet import Prophet
+try:
+    from prophet import Prophet
+except Exception:  # pragma: no cover - runtime fallback for envs without prophet
+    Prophet = None
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import Ridge
 from xgboost import XGBRegressor
@@ -86,6 +89,8 @@ def _get_forecast_kernel():
 @lru_cache(maxsize=1)
 def _check_prophet_runtime():
     """Preflight Prophet runtime once to avoid repeated per-SPU hard failures."""
+    if Prophet is None:
+        return False, "prophet_not_installed"
     try:
         test_df = pd.DataFrame(
             {
@@ -141,6 +146,10 @@ def calculate_wmape(y_true, y_pred, min_non_zero_points=1):
 
 
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    if Prophet is None:
+        if verbose:
+            print("Prophet skipped: package not installed")
+        return None
     try:
         regime = _infer_model_regime(train, screening)
         df_train = pd.DataFrame({'ds': train.index, 'y': train.values})
@@ -708,6 +717,10 @@ def calculate_sku_accuracy(actual, pred):
 
 def predict_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None):
     if winner['name'] == 'Prophet':
+        if Prophet is None:
+            clean = _series_to_float_series(series)
+            fallback_value = float(clean.tail(8).mean()) if not clean.empty else 0.0
+            return np.maximum(np.full(n_steps, fallback_value), 0.0)
         df = pd.DataFrame({'ds': series.index, 'y': series.values})
         if exog_series is not None:
             # 纭繚澶栫敓鍙橀噺鐨勬椂闂寸储寮曚笌series鐨勬椂闂寸储寮曚竴鑷?            exog_series = exog_series.reindex(series.index)
@@ -807,6 +820,9 @@ def safe_predictions(preds, fallback_value, model_name, history_series=None):
 
 
 def extract_seasonal_factors_52week(series, period=52):
+    if Prophet is None:
+        factors = {f'week_{i+1}': 1.0 for i in range(period)}
+        return json.dumps(factors, ensure_ascii=False)
     try:
         if len(series) < period:
             factors = {f'week_{i+1}': 1.0 for i in range(period)}
