@@ -467,6 +467,48 @@ def run_croston_sba(train, test, train_exog=None, test_exog=None, verbose=False,
         return None
 
 
+def run_low_signal_median(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    try:
+        clean = _series_to_float_series(train)
+        if clean.empty:
+            return None
+
+        recent = clean.tail(min(16, len(clean)))
+        recent_non_zero = recent[recent > 0]
+        zero_ratio = float((recent == 0).mean()) if len(recent) > 0 else 1.0
+        anchor = float(recent_non_zero.median()) if not recent_non_zero.empty else float(recent.mean())
+        anchor = max(anchor, 0.0)
+        if anchor == 0.0:
+            forecast = np.zeros(len(test))
+        else:
+            if zero_ratio <= 0.25:
+                forecast = np.full(len(test), anchor, dtype=float)
+            elif zero_ratio <= 0.5:
+                decay = np.linspace(1.0, 0.65, len(test))
+                forecast = anchor * decay
+            else:
+                decay = np.linspace(1.0, 0.35, len(test))
+                forecast = anchor * decay
+
+        if screening is not None and float(screening.get("recent_mean", 0.0)) > 0:
+            cap = max(float(screening.get("recent_mean", 0.0)) * 1.4, 1.0)
+            forecast = np.minimum(forecast, cap)
+
+        forecast = np.maximum(forecast, 0.0)
+        wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        return {
+            "name": "LowSignalMedian",
+            "wmape": wmape,
+            "preds": forecast,
+            "model": None,
+            "params": {"strategy": "recent_median", "recent_window": int(len(recent))},
+        }
+    except Exception as e:
+        if verbose:
+            print(f"LowSignalMedian 澶辫触: {e}")
+        return None
+
+
 def run_all_models(
     train,
     test,
@@ -587,6 +629,11 @@ def run_all_models(
     if croston_result:
         models.append(croston_result)
         _emit_model_log(log_fn, f"CrostonSBA: WMAPE={croston_result['wmape']:.2%}")
+
+    low_signal_result = run_low_signal_median(train, test, train_exog, test_exog, verbose, screening=screening)
+    if low_signal_result:
+        models.append(low_signal_result)
+        _emit_model_log(log_fn, f"LowSignalMedian: WMAPE={low_signal_result['wmape']:.2%}")
 
     seasonal_naive_result = run_seasonal_naive(train, test, train_exog, test_exog, verbose, screening=screening)
     if seasonal_naive_result:
