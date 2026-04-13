@@ -106,7 +106,13 @@ def main() -> int:
         with process_lock(args.lock_file):
             store = PlatformStore(args.platform_db)
             manager = ForecastRuntimeManager(store=store, db_url=args.db_url)
-            active_run = store.get_current_run()
+            if hasattr(store, "get_current_run"):
+                active_run = store.get_current_run()
+            else:
+                active_run = next(
+                    (run for run in store.list_runs(limit=20) if run.get("status") in ACTIVE_STATUSES),
+                    None,
+                )
             if active_run and active_run.get("status") in ACTIVE_STATUSES:
                 print(f"SKIP=active run exists RUN_ID={active_run['id']} STATUS={active_run['status']}", flush=True)
                 return 0
