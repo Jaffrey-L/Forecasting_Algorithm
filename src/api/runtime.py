@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -157,6 +158,37 @@ class ForecastRuntimeManager:
     def _append_log(self, run_id: str, level: str, message: str) -> None:
         self.store.add_log(run_id, level, message)
 
+    def _load_source_data_with_heartbeat(self, run_id: str) -> pd.DataFrame:
+        result: Dict[str, Any] = {}
+        error: Dict[str, Exception] = {}
+        done = threading.Event()
+        started = time.time()
+
+        def _worker() -> None:
+            try:
+                result["df"] = get_data_from_db(self.db_url)
+            except Exception as exc:  # pragma: no cover
+                error["exc"] = exc
+            finally:
+                done.set()
+
+        self._append_log(run_id, "info", "Starting source SQL query.")
+        self.store.update_run(run_id, current_spu="SQL query running")
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        while not done.wait(timeout=15):
+            elapsed = int(time.time() - started)
+            self._append_log(run_id, "info", f"SQL query still running ({elapsed}s elapsed).")
+
+        worker.join(timeout=1)
+        elapsed = time.time() - started
+        if "exc" in error:
+            raise error["exc"]
+        df = result.get("df", pd.DataFrame())
+        self._append_log(run_id, "info", f"SQL query finished in {elapsed:.1f}s, rows={len(df)}.")
+        return df
+
     def _load_all_spus(self) -> List[str]:
         eligible_spus, _total_spus = self._load_all_spus_with_scope()
         return eligible_spus
@@ -242,6 +274,9 @@ class ForecastRuntimeManager:
             self.store.update_run(
                 run_id,
                 selected_spus_json=json.dumps(resolved["selected_spus"], ensure_ascii=False),
+                total_count=resolved.get("count", len(resolved["selected_spus"])),
+                processed_count=0,
+                success_count=0,
                 summary={
                     "scope_total_spus": resolved.get("scope_total_spus", len(resolved["selected_spus"])),
                     "scope_eligible_spus": resolved.get("scope_eligible_spus", len(resolved["selected_spus"])),
@@ -260,9 +295,12 @@ class ForecastRuntimeManager:
                 "info",
                 f"Selection resolved: {resolved['count']} SPUs selected.",
             )
-            df_all = get_data_from_db(self.db_url)
+            self._append_log(run_id, "info", "Loading source dataset.")
+            df_all = self._load_source_data_with_heartbeat(run_id)
             if df_all.empty:
                 raise RuntimeError("No source data was returned from the database.")
+            self._append_log(run_id, "info", "Normalizing source columns and data types.")
+            self.store.update_run(run_id, current_spu="Preparing source data")
             df_all.columns = [str(col).lower() for col in df_all.columns]
             df_all["sales"] = pd.to_numeric(df_all["sales"], errors="coerce").fillna(0)
             df_all["date"] = pd.to_datetime(df_all["date"], format="mixed")
@@ -271,10 +309,20 @@ class ForecastRuntimeManager:
             selected_spus = resolved["selected_spus"] or sorted(df_all["spu"].unique().tolist())
             if selected_spus:
                 df_all = df_all[df_all["spu"].isin(selected_spus)].copy()
+            self._append_log(
+                run_id,
+                "info",
+                f"Source scope filter applied: selected_spus={len(selected_spus)}, rows_after_filter={len(df_all)}.",
+            )
             spus = sorted(df_all["spu"].unique().tolist())
             total_spus = len(spus)
             exog_cols = [col for col in df_all.columns if col in ["ad_cost", "price"]]
             self.store.update_run(run_id, total_count=total_spus)
+            self._append_log(
+                run_id,
+                "info",
+                f"Execution plan ready: total_spus={total_spus}, exog_cols={','.join(exog_cols) if exog_cols else 'none'}.",
+            )
             successful = 0
             failures: List[Dict[str, str]] = []
             all_results: List[pd.DataFrame] = []
@@ -294,6 +342,7 @@ class ForecastRuntimeManager:
                 self.store.upsert_run_spu(run_id, spu, "running", message="Processing")
                 self._append_log(run_id, "info", f"Processing SPU {spu} ({index}/{total_spus}).")
                 self._append_log(run_id, "info", f"[SPU {spu}] 模型竞赛准备开始。")
+                self._append_log(run_id, "info", f"[SPU {spu}] Model competition starting.")
                 df_spu = df_all[df_all["spu"] == spu].copy()
                 result_df, message, _viz, _profile = process_single_spu(
                     spu,
