@@ -10,7 +10,7 @@ from lightgbm import LGBMRegressor
 import itertools
 import time
 import random
-from functools import partial
+from functools import lru_cache, partial
 from src.forecasting.models import *
 
 forecast_kernel = None
@@ -81,6 +81,28 @@ def _get_forecast_kernel():
     from src.forecasting import kernel as loaded_kernel
 
     return loaded_kernel
+
+
+@lru_cache(maxsize=1)
+def _check_prophet_runtime():
+    """Preflight Prophet runtime once to avoid repeated per-SPU hard failures."""
+    try:
+        test_df = pd.DataFrame(
+            {
+                "ds": pd.date_range("2024-01-07", periods=20, freq="W"),
+                "y": np.linspace(10.0, 30.0, 20),
+            }
+        )
+        model = Prophet(
+            weekly_seasonality=False,
+            yearly_seasonality=False,
+            daily_seasonality=False,
+        )
+        model.fit(test_df)
+        model.predict(test_df.tail(2))
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def clean_series(series):
@@ -418,13 +440,17 @@ def run_all_models(
         _emit_model_log(log_fn, "跳过 Prophet（conservative 策略）")
     else:
         enabled_base_models.append("Prophet")
-        _emit_model_log(log_fn, "运行 Prophet...")
-        prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
-        if prophet_result:
-            models.append(prophet_result)
-            _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+        prophet_ready, prophet_reason = _check_prophet_runtime()
+        if not prophet_ready:
+            _emit_model_log(log_fn, f"Prophet: 跳过（运行环境不可用: {prophet_reason}）")
         else:
-            _emit_model_log(log_fn, "Prophet: 失败")
+            _emit_model_log(log_fn, "运行 Prophet...")
+            prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
+            if prophet_result:
+                models.append(prophet_result)
+                _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+            else:
+                _emit_model_log(log_fn, "Prophet: 失败")
 
     if conservative:
         _emit_model_log(log_fn, "跳过 XGBoost（conservative 策略）")

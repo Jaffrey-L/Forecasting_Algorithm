@@ -361,7 +361,12 @@ def process_single_spu(
                 show_plot=True,
             )
 
-        return result_df, f"{winner['name']} (WMAPE: {winner['wmape']:.2%}) [{total_time:.1f}s]", viz_data, profile
+        return (
+            result_df,
+            f"{winner['name']} (WMAPE: {winner['wmape']:.2%}, policy={model_policy}) [{total_time:.1f}s]",
+            viz_data,
+            profile,
+        )
     except Exception as exc:
         import traceback
 

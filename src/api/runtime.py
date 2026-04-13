@@ -362,6 +362,7 @@ class ForecastRuntimeManager:
             successful = 0
             failures: List[Dict[str, str]] = []
             all_results: List[pd.DataFrame] = []
+            policy_counts: Dict[str, int] = {"standard": 0, "conservative": 0, "unknown": 0}
 
             for index, spu in enumerate(spus, start=1):
                 if stop_event.is_set():
@@ -396,6 +397,12 @@ class ForecastRuntimeManager:
                     successful += 1
                     winner_algo = str(result_df["winner_algo"].iloc[0])
                     wmape = float(result_df["validation_wmape"].iloc[0])
+                    if "policy=conservative" in (message or ""):
+                        policy_counts["conservative"] += 1
+                    elif "policy=standard" in (message or ""):
+                        policy_counts["standard"] += 1
+                    else:
+                        policy_counts["unknown"] += 1
                     self.store.upsert_run_spu(
                         run_id,
                         spu,
@@ -419,6 +426,9 @@ class ForecastRuntimeManager:
                 "successful_spus": successful,
                 "failed_spus": len(failures),
                 "failed_details": failures[:20],
+                "policy_standard_spus": policy_counts["standard"],
+                "policy_conservative_spus": policy_counts["conservative"],
+                "policy_unknown_spus": policy_counts["unknown"],
                 "scope_total_spus": run.get("summary", {}).get("scope_total_spus", total_spus),
                 "scope_eligible_spus": run.get("summary", {}).get("scope_eligible_spus", total_spus),
                 "scope_excluded_spus": run.get("summary", {}).get("scope_excluded_spus", 0),

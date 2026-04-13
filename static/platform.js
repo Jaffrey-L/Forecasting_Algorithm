@@ -180,6 +180,9 @@ function setRunStatus(run) {
 function updateRunSummary(run) {
   const summary = run?.summary || {};
   const failedSpus = summary.failed_spus ?? Math.max((run?.total_count || 0) - (run?.success_count || 0), 0);
+  const policySummary = (summary.policy_standard_spus != null || summary.policy_conservative_spus != null)
+    ? `${summary.policy_standard_spus || 0}标准 / ${summary.policy_conservative_spus || 0}保守`
+    : "-";
   const startedAt = parseRunTime(run?.started_at);
   const finishedAt = parseRunTime(run?.finished_at);
   const now = new Date();
@@ -187,6 +190,7 @@ function updateRunSummary(run) {
   const items = [
     ["触发方式", run?.trigger_source || "-"],
     ["模式", run?.mode || "-"],
+    ["策略", policySummary],
     ["启动时间", formatDateTime(run?.started_at)],
     ["结束时间", formatDateTime(run?.finished_at)],
     ["耗时", formatDurationMs(durationMs)],
