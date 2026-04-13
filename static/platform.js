@@ -38,6 +38,35 @@ function isActiveRunStatus(status) {
   return ACTIVE_STATUSES.has(status || "");
 }
 
+function parseRunTime(raw) {
+  if (!raw) return null;
+  const value = String(raw).trim();
+  if (!value) return null;
+  const normalized = value.includes("T")
+    ? value
+    : value.replace(" ", "T");
+  const withZone = normalized.endsWith("Z") ? normalized : `${normalized}Z`;
+  const date = new Date(withZone);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatDateTime(raw) {
+  const date = parseRunTime(raw);
+  if (!date) return "-";
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDurationMs(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}小时${minutes}分${seconds}秒`;
+  if (minutes > 0) return `${minutes}分${seconds}秒`;
+  return `${seconds}秒`;
+}
+
 function setButtonBusy(buttonId, isBusy, busyLabel, idleLabel) {
   const button = el(buttonId);
   if (!button) return;
@@ -147,9 +176,16 @@ function setRunStatus(run) {
 function updateRunSummary(run) {
   const summary = run?.summary || {};
   const failedSpus = summary.failed_spus ?? Math.max((run?.total_count || 0) - (run?.success_count || 0), 0);
+  const startedAt = parseRunTime(run?.started_at);
+  const finishedAt = parseRunTime(run?.finished_at);
+  const now = new Date();
+  const durationMs = startedAt ? ((finishedAt || now).getTime() - startedAt.getTime()) : NaN;
   const items = [
     ["触发方式", run?.trigger_source || "-"],
     ["模式", run?.mode || "-"],
+    ["启动时间", formatDateTime(run?.started_at)],
+    ["结束时间", formatDateTime(run?.finished_at)],
+    ["耗时", formatDurationMs(durationMs)],
     ["平均 WMAPE", summary.average_wmape ? `${(summary.average_wmape * 100).toFixed(2)}%` : "-"],
     ["失败 SPU", failedSpus],
   ];
