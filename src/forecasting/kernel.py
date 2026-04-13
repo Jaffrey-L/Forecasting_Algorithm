@@ -128,6 +128,16 @@ def process_single_spu(
         series = series[series.index < current_week_end]
         original_series = series.copy()
 
+        # Heuristic: if the latest weekly bucket is zero while recent history is active,
+        # treat it as an incomplete ingestion week and exclude it from training/validation.
+        if len(series) >= 20 and float(series.iloc[-1]) == 0.0:
+            recent_active_weeks = int((series.iloc[-5:-1] > 0).sum()) if len(series) >= 5 else 0
+            if recent_active_weeks >= 3:
+                series = series.iloc[:-1]
+                original_series = original_series.iloc[:-1]
+                if log_fn is not None:
+                    log_fn(f"SPU {spu} detected trailing zero week; trimmed latest week for stable validation.")
+
         has_exog, exog_series, used_exog = False, None, []
         if exog_cols:
             available = [c for c in exog_cols if c in df_spu_idx.columns]
@@ -148,6 +158,8 @@ def process_single_spu(
             original_series = original_series.iloc[-156:]
             if has_exog and exog_series is not None:
                 exog_series = exog_series.iloc[-156:]
+        if has_exog and exog_series is not None:
+            exog_series = exog_series.reindex(series.index).ffill().bfill().fillna(0)
 
         screening = screen_weekly_series(series)
         if screening["insufficient_data"]:
@@ -171,8 +183,23 @@ def process_single_spu(
         train_exog = exog_series.iloc[:-test_len] if has_exog else None
         test_exog = exog_series.iloc[-test_len:] if has_exog else None
         validation_non_zero_points = int((test > 0).sum())
-        if validation_non_zero_points < 4:
-            return None, "验证窗口非零样本不足，已跳过标准预测链", None, None
+        validation_total_sales = float(test.sum())
+        low_signal_window = validation_non_zero_points < 6 or validation_total_sales < 120
+        model_policy = (
+            "conservative"
+            if screening.get("recommendation") != "standard" or low_signal_window
+            else "standard"
+        )
+        if log_fn is not None and model_policy == "conservative":
+            log_fn(
+                "SPU {} switched to conservative policy: recommendation={}, "
+                "validation_non_zero_points={}, validation_total_sales={:.2f}.".format(
+                    spu,
+                    screening.get("recommendation"),
+                    validation_non_zero_points,
+                    validation_total_sales,
+                )
+            )
         future_dates = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
 
         if verbose:
@@ -187,6 +214,7 @@ def process_single_spu(
             test_exog,
             verbose=False,
             screening=screening,
+            model_policy=model_policy,
             log_fn=(lambda message: log_fn(f"SPU {spu} | {message}")) if log_fn is not None else None,
         )
         valid_results = [result for result in all_results if np.isfinite(result.get("wmape", float("inf")))]

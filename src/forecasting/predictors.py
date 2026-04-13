@@ -14,6 +14,7 @@ from functools import partial
 from src.forecasting.models import *
 
 forecast_kernel = None
+MAX_WMAPE_CAP = 9.999
 
 
 def _series_to_float_series(series):
@@ -107,11 +108,14 @@ def calculate_wmape(y_true, y_pred, min_non_zero_points=1):
     y_pred = y_pred[:min_length]
     mask = y_true != 0
     if np.count_nonzero(mask) < min_non_zero_points:
-        return float("inf") if min_non_zero_points > 1 else 0.0
+        return MAX_WMAPE_CAP if min_non_zero_points > 1 else 0.0
     denominator = np.sum(np.abs(y_true[mask]))
     if denominator == 0:
-        return float("inf") if min_non_zero_points > 1 else 0.0
-    return np.sum(np.abs(y_true[mask] - y_pred[mask])) / denominator
+        return MAX_WMAPE_CAP if min_non_zero_points > 1 else 0.0
+    value = np.sum(np.abs(y_true[mask] - y_pred[mask])) / denominator
+    if not np.isfinite(value):
+        return MAX_WMAPE_CAP
+    return float(min(value, MAX_WMAPE_CAP))
 
 
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
@@ -172,8 +176,6 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
             print(f"Prophet 澶辫触: {e}")
             import traceback
             traceback.print_exc()
-        else:
-            print(f"Prophet 澶辫触: {e}")
         return None
 
 
@@ -390,39 +392,65 @@ def run_zero_aware_naive(train, test, train_exog=None, test_exog=None, verbose=F
         return None
 
 
-def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, verbose=False, log_fn=None, screening=None):
+def run_all_models(
+    train,
+    test,
+    mode='smart',
+    train_exog=None,
+    test_exog=None,
+    verbose=False,
+    log_fn=None,
+    screening=None,
+    model_policy='standard',
+):
     """
     运行所有预测模型，并记录每个模型的效果。
     """
     models = []
+    conservative = str(model_policy).lower() == "conservative"
+    enabled_base_models = []
 
     _emit_model_log(log_fn, f"\n模型竞赛启动 (mode={mode})...")
+    _emit_model_log(log_fn, f"模型策略: {'conservative' if conservative else 'standard'}")
     _emit_model_log(log_fn, "=" * 70)
 
-    _emit_model_log(log_fn, "运行 Prophet...")
-    prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
-    if prophet_result:
-        models.append(prophet_result)
-        _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+    if conservative:
+        _emit_model_log(log_fn, "跳过 Prophet（conservative 策略）")
     else:
-        _emit_model_log(log_fn, "Prophet: 失败")
+        enabled_base_models.append("Prophet")
+        _emit_model_log(log_fn, "运行 Prophet...")
+        prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
+        if prophet_result:
+            models.append(prophet_result)
+            _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+        else:
+            _emit_model_log(log_fn, "Prophet: 失败")
 
-    _emit_model_log(log_fn, "运行 XGBoost...")
-    xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose, screening=screening)
-    if xgboost_result:
-        models.append(xgboost_result)
-        _emit_model_log(log_fn, f"XGBoost: WMAPE={xgboost_result['wmape']:.2%}")
+    if conservative:
+        _emit_model_log(log_fn, "跳过 XGBoost（conservative 策略）")
     else:
-        _emit_model_log(log_fn, "XGBoost: 失败")
+        enabled_base_models.append("XGBoost")
+        _emit_model_log(log_fn, "运行 XGBoost...")
+        xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose, screening=screening)
+        if xgboost_result:
+            models.append(xgboost_result)
+            _emit_model_log(log_fn, f"XGBoost: WMAPE={xgboost_result['wmape']:.2%}")
+        else:
+            _emit_model_log(log_fn, "XGBoost: 失败")
 
-    _emit_model_log(log_fn, "运行 LightGBM...")
-    lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose, screening=screening)
-    if lightgbm_result:
-        models.append(lightgbm_result)
-        _emit_model_log(log_fn, f"LightGBM: WMAPE={lightgbm_result['wmape']:.2%}")
+    if conservative:
+        _emit_model_log(log_fn, "跳过 LightGBM（conservative 策略）")
     else:
-        _emit_model_log(log_fn, "LightGBM: 失败")
+        enabled_base_models.append("LightGBM")
+        _emit_model_log(log_fn, "运行 LightGBM...")
+        lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose, screening=screening)
+        if lightgbm_result:
+            models.append(lightgbm_result)
+            _emit_model_log(log_fn, f"LightGBM: WMAPE={lightgbm_result['wmape']:.2%}")
+        else:
+            _emit_model_log(log_fn, "LightGBM: 失败")
 
+    enabled_base_models.append("AutoARIMA")
     _emit_model_log(log_fn, "运行 AutoARIMA...")
     autoarima_result = run_auto_arima(train, test, train_exog, test_exog, verbose, screening=screening)
     if autoarima_result:
@@ -434,7 +462,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
     models = [m for m in models if m is not None]
     base_results = {m['name']: m for m in models}
 
-    _emit_model_log(log_fn, f"\n基础模型运行完成: {len(models)}/4 个成功")
+    _emit_model_log(log_fn, f"\n基础模型运行完成: {len(models)}/{len(enabled_base_models)} 个成功")
 
     if len(models) >= 2:
         _emit_model_log(log_fn, "运行融合算法...")
