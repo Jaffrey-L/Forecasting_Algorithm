@@ -41,7 +41,14 @@ body {
 .eyebrow { margin: 0 0 10px; font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; opacity: 0.75; }
 .hero h1 { margin: 0; font-size: 42px; }
 .hero-copy { max-width: 720px; margin-top: 12px; line-height: 1.7; color: rgba(255, 249, 241, 0.84); }
-.hero-stats { display: none; }
+.hero-stats,
+.hero .hero-stats {
+    display: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+    max-width: 0 !important;
+    overflow: hidden !important;
+}
 
 .panel, .stat-card, .metric, .split-card, .result-panel {
     border: 1px solid rgba(255, 255, 255, 0.38);

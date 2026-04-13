@@ -38,6 +38,10 @@ function isActiveRunStatus(status) {
   return ACTIVE_STATUSES.has(status || "");
 }
 
+function stripHeroStats() {
+  document.querySelectorAll(".hero-stats").forEach((node) => node.remove());
+}
+
 function parseRunTime(raw) {
   if (!raw) return null;
   const value = String(raw).trim();
@@ -605,6 +609,7 @@ function bindEvents() {
 }
 
 async function bootstrap() {
+  stripHeroStats();
   bindEvents();
   setSelectionType("all");
   setRunFeedback("", "info", false);
