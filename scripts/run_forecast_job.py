@@ -16,11 +16,14 @@ import sys
 import time
 from contextlib import contextmanager
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from src.api.platform_store import PlatformStore
 from src.api.runtime import ForecastRuntimeManager, VALID_MODES
 
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_PLATFORM_DB = os.path.join(PROJECT_ROOT, "data", "platform_state.db")
 DEFAULT_DB_URL = os.getenv(
     "SALES_FORECAST_DB_URL",
