@@ -1,21 +1,30 @@
 import json
-import re
+import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import text
 
+from src.api.linux_ops import compute_next_run_at
 from src.api.platform_store import PlatformStore, utcnow_iso
-from src.database.repositories import get_database_engine, query_forecast_results, save_to_database
+from src.database.repositories import query_forecast_results, save_to_database
 from src.forecasting.execution_bridge import get_data_from_db, process_single_spu
 
 
-TOKEN_SPLIT_RE = re.compile(r"[\s,;|\r\n\t]+")
 VALID_MODES = {"fast", "smart", "full"}
 DEFAULT_SCOPE_MIN_WEEKS = 108
 DEFAULT_SCOPE_RECENT_WEEKS = 4
+DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS = 8
+DEFAULT_SCOPE_RECENT_WINDOW_WEEKS = 12
+DEFAULT_SCOPE_MAX_ZERO_RATIO_26W = 0.25
+DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES = 4.0
+ACTIVE_RUN_STATUSES = {"queued", "running", "stopping"}
+SCHEDULER_POLL_SECONDS = 30
+SCHEDULER_RECOVERY_WAIT_SECONDS = 5
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_spu_values(series: pd.Series) -> pd.Series:
@@ -23,20 +32,10 @@ def normalize_spu_values(series: pd.Series) -> pd.Series:
     return normalized[(normalized != "") & (normalized != "-")]
 
 
-def parse_manual_spus(raw: str) -> Dict[str, Any]:
-    tokens = [token.strip() for token in TOKEN_SPLIT_RE.split(raw or "") if token.strip()]
-    seen = set()
-    spus: List[str] = []
-    invalid: List[str] = []
-    for token in tokens:
-        cleaned = token.upper()
-        if len(cleaned) > 64:
-            invalid.append(token)
-            continue
-        if cleaned not in seen:
-            seen.add(cleaned)
-            spus.append(cleaned)
-    return {"spus": spus, "invalid_items": invalid}
+def _latest_active_week_buckets(weekly_sales: pd.DataFrame, count: int) -> List[pd.Timestamp]:
+    weekly_totals = weekly_sales.groupby("week_bucket")["sales"].sum().sort_index()
+    active_buckets = weekly_totals[weekly_totals > 0].index.tolist()
+    return active_buckets[-count:]
 
 
 class ForecastRuntimeManager:
@@ -47,58 +46,29 @@ class ForecastRuntimeManager:
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_seen_keys: set[str] = set()
+        self._schedule_run_lock = threading.Lock()
 
     def start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
             return
+        if self._scheduler_thread and not self._scheduler_thread.is_alive():
+            logger.warning("Scheduler thread was not alive; restarting a fresh scheduler loop.")
         self._scheduler_stop.clear()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+        logger.info("Forecast scheduler loop started.")
 
     def stop_scheduler(self) -> None:
         self._scheduler_stop.set()
+        if self._scheduler_thread and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=5)
+            if self._scheduler_thread.is_alive():
+                logger.warning("Scheduler loop did not stop within timeout.")
 
     def resolve_selection(self, selection_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         selection_type = (selection_type or "").lower()
-        if selection_type == "manual":
-            parsed = parse_manual_spus(payload.get("manual_spus", ""))
-            return {
-                "selection_type": "manual",
-                "selection_payload": {"manual_spus": payload.get("manual_spus", "")},
-                "selected_spus": parsed["spus"],
-                "count": len(parsed["spus"]),
-                "invalid_items": parsed["invalid_items"],
-                "preview": parsed["spus"][:50],
-            }
-        if selection_type == "sql":
-            sql_query = (payload.get("sql_query") or "").strip()
-            if not sql_query:
-                raise ValueError("SQL selection requires sql_query.")
-            if not sql_query.lower().startswith("select"):
-                raise ValueError("Only SELECT statements are allowed for SQL selection.")
-            engine = get_database_engine(self.db_url)
-            try:
-                df = pd.read_sql(text(sql_query), con=engine)
-            finally:
-                engine.dispose()
-            if df.empty:
-                values: List[str] = []
-            else:
-                columns = [str(column).lower() for column in df.columns]
-                # MVP 阶段强约束：SQL 只能返回单列且列名必须是 spu
-                if len(columns) != 1 or columns[0] != "spu":
-                    raise ValueError("SQL must return exactly one column named spu.")
-                series = df.iloc[:, 0]
-                values = series.astype(str).tolist()
-            parsed = parse_manual_spus("\n".join(values))
-            return {
-                "selection_type": "sql",
-                "selection_payload": {"sql_query": sql_query},
-                "selected_spus": parsed["spus"],
-                "count": len(parsed["spus"]),
-                "invalid_items": parsed["invalid_items"],
-                "preview": parsed["spus"][:50],
-            }
+        if selection_type != "all":
+            raise ValueError("Only the standard all selection workflow is supported in the engineering workflow.")
         if selection_type == "all":
             all_spus, total_spus = self._load_all_spus_with_scope()
             return {
@@ -134,9 +104,19 @@ class ForecastRuntimeManager:
         )
         stop_event = threading.Event()
         self._runs[run["id"]] = stop_event
+        self.store.update_run(
+            run["id"],
+            current_spu="等待启动",
+        )
+        self._append_log(
+            run["id"],
+            "info",
+            f"Run {run['id']} accepted and queued in {mode} mode.",
+        )
+        queued_run = self.store.get_run(run["id"])
         thread = threading.Thread(target=self._execute_run, args=(run["id"], stop_event), daemon=True)
         thread.start()
-        return self.store.get_run(run["id"])
+        return queued_run or self.store.get_run(run["id"])
 
     def stop_run(self, run_id: str) -> Dict[str, Any]:
         stop_event = self._runs.get(run_id)
@@ -153,13 +133,23 @@ class ForecastRuntimeManager:
         config = self.store.get_config(config_id)
         if not config:
             raise ValueError("Config not found.")
-        return self.create_run(
-            mode=config["mode"],
-            selection_type=config["selection_type"],
-            selection_payload=config["selection_payload"],
-            config_id=config_id,
-            trigger_source=trigger_source,
-        )
+        with self._schedule_run_lock:
+            active_run = self._find_active_run_for_config(config_id)
+            if active_run:
+                logger.info(
+                    "Skip run creation for config %s because active run %s is still %s.",
+                    config_id,
+                    active_run["id"],
+                    active_run["status"],
+                )
+                return active_run
+            return self.create_run(
+                mode=config["mode"],
+                selection_type=config["selection_type"],
+                selection_payload=config["selection_payload"],
+                config_id=config_id,
+                trigger_source=trigger_source,
+            )
 
     def get_results(self, **filters: Any) -> List[Dict[str, Any]]:
         return query_forecast_results(self.db_url, **filters)
@@ -194,9 +184,11 @@ class ForecastRuntimeManager:
             .sum()
         )
         weekly_counts = weekly_sales.groupby("spu")["week_bucket"].nunique()
-        recent_week_buckets = sorted(weekly_sales["week_bucket"].dropna().unique().tolist())[-DEFAULT_SCOPE_RECENT_WEEKS :]
+        recent_week_buckets = _latest_active_week_buckets(weekly_sales, DEFAULT_SCOPE_RECENT_WEEKS)
         if len(recent_week_buckets) < DEFAULT_SCOPE_RECENT_WEEKS:
             return [], len(all_spus)
+        recent_window_buckets = _latest_active_week_buckets(weekly_sales, DEFAULT_SCOPE_RECENT_WINDOW_WEEKS)
+        recent_26_buckets = _latest_active_week_buckets(weekly_sales, 26)
 
         recent_sales = (
             weekly_sales[weekly_sales["week_bucket"].isin(recent_week_buckets)]
@@ -205,8 +197,26 @@ class ForecastRuntimeManager:
             .fillna(0.0)
         )
         active_recent_spus = recent_sales.index[(recent_sales > 0).all(axis=1)]
+        recent_window_sales = (
+            weekly_sales[weekly_sales["week_bucket"].isin(recent_window_buckets)]
+            .pivot(index="spu", columns="week_bucket", values="sales")
+            .reindex(columns=recent_window_buckets, fill_value=0.0)
+            .fillna(0.0)
+        )
+        recent_non_zero_counts = (recent_window_sales > 0).sum(axis=1)
+        recent_4_totals = recent_sales.sum(axis=1)
+        recent_26_sales = (
+            weekly_sales[weekly_sales["week_bucket"].isin(recent_26_buckets)]
+            .pivot(index="spu", columns="week_bucket", values="sales")
+            .reindex(columns=recent_26_buckets, fill_value=0.0)
+            .fillna(0.0)
+        )
+        recent_26_zero_ratio = (recent_26_sales <= 0).sum(axis=1) / max(len(recent_26_buckets), 1)
         eligible_spus = active_recent_spus[
-            weekly_counts.reindex(active_recent_spus, fill_value=0) >= DEFAULT_SCOPE_MIN_WEEKS
+            (weekly_counts.reindex(active_recent_spus, fill_value=0) >= DEFAULT_SCOPE_MIN_WEEKS)
+            & (recent_non_zero_counts.reindex(active_recent_spus, fill_value=0) >= DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS)
+            & (recent_4_totals.reindex(active_recent_spus, fill_value=0.0) >= DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES)
+            & (recent_26_zero_ratio.reindex(active_recent_spus, fill_value=1.0) <= DEFAULT_SCOPE_MAX_ZERO_RATIO_26W)
         ].tolist()
         return sorted(eligible_spus), len(all_spus)
 
@@ -362,24 +372,106 @@ class ForecastRuntimeManager:
 
     def _scheduler_loop(self) -> None:
         while not self._scheduler_stop.is_set():
-            self._poll_schedules()
-            self._scheduler_stop.wait(30)
+            try:
+                self._poll_schedules()
+            except Exception:
+                logger.exception("Scheduler poll failed unexpectedly; continuing after recovery wait.")
+                self._scheduler_stop.wait(SCHEDULER_RECOVERY_WAIT_SECONDS)
+                continue
+            self._scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
 
     def _poll_schedules(self) -> None:
-        now = datetime.now()
+        now_utc = datetime.now(timezone.utc)
         for schedule in self.store.list_schedules():
             if not schedule["enabled"]:
                 continue
-            if schedule["weekday"] != now.weekday():
+            due_slot = self._current_due_slot(schedule, now_utc)
+            if due_slot is None:
                 continue
-            if schedule["hour"] != now.hour or schedule["minute"] != now.minute:
+            if self._already_triggered_for_slot(schedule, due_slot):
                 continue
-            dedupe_key = f"{schedule['id']}:{now.strftime('%Y%m%d%H%M')}"
+            dedupe_key = f"{schedule['id']}:{due_slot.strftime('%Y%m%d%H%M')}"
             if dedupe_key in self._scheduler_seen_keys:
                 continue
             self._scheduler_seen_keys.add(dedupe_key)
-            self.store.mark_schedule_triggered(schedule["id"], utcnow_iso())
             try:
-                self.run_from_config(schedule["config_id"], trigger_source="schedule")
+                run = self.run_from_config(schedule["config_id"], trigger_source="schedule")
+                self.store.mark_schedule_triggered(
+                    schedule["id"],
+                    due_slot.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                )
+                if run.get("trigger_source") == "schedule":
+                    logger.info(
+                        "Schedule %s triggered config %s at slot %s, run_id=%s.",
+                        schedule["id"],
+                        schedule["config_id"],
+                        due_slot.isoformat(),
+                        run.get("id"),
+                    )
+                else:
+                    logger.warning(
+                        "Schedule %s skipped new run for config %s because active run_id=%s status=%s.",
+                        schedule["id"],
+                        schedule["config_id"],
+                        run.get("id"),
+                        run.get("status"),
+                    )
             except Exception:
-                pass
+                self._scheduler_seen_keys.discard(dedupe_key)
+                logger.exception(
+                    "Failed to trigger schedule %s for config %s.",
+                    schedule["id"],
+                    schedule["config_id"],
+                )
+
+    def _find_active_run_for_config(self, config_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not config_id:
+            return None
+        for run in self.store.list_runs(limit=200):
+            if run.get("config_id") != config_id:
+                continue
+            if run.get("status") in ACTIVE_RUN_STATUSES:
+                return run
+        return None
+
+    @staticmethod
+    def _resolve_timezone(timezone_name: Optional[str]) -> ZoneInfo:
+        try:
+            return ZoneInfo(timezone_name or "Asia/Shanghai")
+        except Exception:
+            return ZoneInfo("Asia/Shanghai")
+
+    @staticmethod
+    def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _already_triggered_for_slot(self, schedule: Dict[str, Any], due_slot_utc: datetime) -> bool:
+        last_triggered_at = self._parse_iso_utc(schedule.get("last_triggered_at"))
+        return bool(last_triggered_at and last_triggered_at >= due_slot_utc)
+
+    def _current_due_slot(self, schedule: Dict[str, Any], now_utc: datetime) -> Optional[datetime]:
+        timezone_name = str(schedule.get("timezone") or "Asia/Shanghai")
+        tz = self._resolve_timezone(timezone_name)
+        now_local = now_utc.astimezone(tz)
+        current_slot = compute_next_run_at(
+            weekday=int(schedule["weekday"]),
+            hour=int(schedule["hour"]),
+            minute=int(schedule["minute"]),
+            timezone_name=timezone_name,
+            now=now_local - timedelta(days=7),
+        )
+        current_slot_utc = current_slot.astimezone(timezone.utc)
+        if current_slot_utc > now_utc:
+            return None
+        if now_utc - current_slot_utc >= timedelta(days=7):
+            return None
+        return current_slot_utc

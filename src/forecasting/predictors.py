@@ -16,6 +16,64 @@ from src.forecasting.models import *
 forecast_kernel = None
 
 
+def _series_to_float_series(series):
+    return pd.Series(series).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _infer_model_regime(train, screening=None):
+    clean = _series_to_float_series(train)
+    history_weeks = len(clean)
+    recent = clean.tail(min(12, history_weeks))
+    recent_zero_weeks = int((recent == 0).sum()) if len(recent) > 0 else 0
+    recent_mean = float(recent.mean()) if len(recent) > 0 else 0.0
+    prior = clean.iloc[:-len(recent)] if history_weeks > len(recent) else pd.Series(dtype=float)
+    prior_mean = float(prior.mean()) if len(prior) > 0 else 0.0
+    zero_ratio = float((clean == 0).mean()) if history_weeks > 0 else 1.0
+
+    if screening is not None:
+        recent_zero_weeks = int(screening.get("recent_zero_weeks", recent_zero_weeks))
+        recent_mean = float(screening.get("recent_mean", recent_mean))
+        prior_mean = float(screening.get("prior_mean", prior_mean))
+        zero_ratio = float(screening.get("zero_ratio", zero_ratio))
+
+    return {
+        "history_weeks": history_weeks,
+        "recent_zero_weeks": recent_zero_weeks,
+        "recent_mean": recent_mean,
+        "prior_mean": prior_mean,
+        "zero_ratio": zero_ratio,
+        "seasonal_ready": history_weeks >= 52,
+        "stable": history_weeks >= 26 and zero_ratio < 0.35,
+        "zero_heavy": zero_ratio >= 0.5 or recent_zero_weeks >= 4,
+    }
+
+
+def _build_zero_aware_forecast(train, n_steps, screening=None):
+    clean = _series_to_float_series(train)
+    if clean.empty:
+        return np.zeros(n_steps)
+
+    regime = _infer_model_regime(clean, screening)
+    recent = clean.tail(min(12, len(clean)))
+    recent_non_zero = recent[recent > 0]
+    anchor = float(recent_non_zero.median()) if not recent_non_zero.empty else float(recent.mean())
+    anchor = max(anchor, 0.0)
+
+    if regime["zero_heavy"] or (screening and screening.get("recommendation") == "zero_override"):
+        if regime["recent_zero_weeks"] >= 4 or regime["recent_mean"] == 0:
+            return np.zeros(n_steps)
+        decay = np.linspace(1.0, 0.25, n_steps)
+        return np.maximum(anchor * decay, 0.0)
+
+    if len(clean) >= 52:
+        season = clean.iloc[-52:].to_numpy()
+        seasonal = np.resize(season, n_steps)
+        blended = 0.65 * seasonal + 0.35 * anchor
+        return np.maximum(blended, 0.0)
+
+    return np.maximum(np.full(n_steps, anchor), 0.0)
+
+
 def _get_forecast_kernel():
     if forecast_kernel is not None:
         return forecast_kernel
@@ -42,19 +100,23 @@ def get_current_week_end():
     return today - pd.Timedelta(days=today.weekday() + 1)
 
 
-def calculate_wmape(y_true, y_pred):
+def calculate_wmape(y_true, y_pred, min_non_zero_points=1):
     y_true, y_pred = np.array(y_true), np.array(y_pred)
-    # 纭繚y_true鍜寉_pred闀垮害涓€鑷?    min_length = min(len(y_true), len(y_pred))
+    min_length = min(len(y_true), len(y_pred))
     y_true = y_true[:min_length]
     y_pred = y_pred[:min_length]
     mask = y_true != 0
-    if not np.any(mask):
-        return 0.0
-    return np.sum(np.abs(y_true[mask] - y_pred[mask])) / np.sum(np.abs(y_true[mask]))
+    if np.count_nonzero(mask) < min_non_zero_points:
+        return float("inf") if min_non_zero_points > 1 else 0.0
+    denominator = np.sum(np.abs(y_true[mask]))
+    if denominator == 0:
+        return float("inf") if min_non_zero_points > 1 else 0.0
+    return np.sum(np.abs(y_true[mask] - y_pred[mask])) / denominator
 
 
-def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False):
+def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     try:
+        regime = _infer_model_regime(train, screening)
         df_train = pd.DataFrame({'ds': train.index, 'y': train.values})
         
         # 妫€鏌f_train鏄惁涓虹┖
@@ -72,12 +134,22 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False):
                 # 鍙坊鍔犲瓨鍦ㄧ殑鍒?                for col in train_exog_aligned.columns:
                     if not train_exog_aligned[col].isna().all():
                         df_train[col] = train_exog_aligned[col].values
+        seasonality_mode = 'multiplicative' if regime["history_weeks"] >= 26 and regime["zero_ratio"] < 0.5 else 'additive'
+        changepoint_prior_scale = 0.05 if regime["stable"] else 0.12
+        seasonality_prior_scale = 5.0 if regime["history_weeks"] >= 104 else 10.0
+        changepoint_range = 0.9 if regime["history_weeks"] >= 52 else 0.8
         model = Prophet(
-            seasonality_mode='multiplicative',
-            changepoint_prior_scale=0.1,
-            seasonality_prior_scale=10.0,
-            changepoint_range=0.8
+            seasonality_mode=seasonality_mode,
+            changepoint_prior_scale=changepoint_prior_scale,
+            seasonality_prior_scale=seasonality_prior_scale,
+            changepoint_range=changepoint_range,
+            weekly_seasonality=False,
+            yearly_seasonality=False,
         )
+        if regime["history_weeks"] >= 13:
+            model.add_seasonality(name='13w', period=13, fourier_order=3)
+        if regime["history_weeks"] >= 52:
+            model.add_seasonality(name='52w', period=52, fourier_order=5)
         if train_exog is not None:
             # 妫€鏌rain_exog鏄惁涓虹┖
             if not train_exog.empty:
@@ -95,7 +167,9 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False):
         forecast = model.predict(df_test)
         y_pred = forecast['yhat'].values
         y_pred = np.maximum(y_pred, 0)
-        wmape = calculate_wmape(test.values, y_pred)
+        if regime["zero_heavy"]:
+            y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.2, 1.0))
+        wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
         return {'name': 'Prophet', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.params if hasattr(model, 'params') else {}}
     except Exception as e:
         if verbose:
@@ -107,8 +181,9 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False):
         return None
 
 
-def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False):
+def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     try:
+        regime = _infer_model_regime(train, screening)
         fe = FeatureEngineer()
         X_train, y_train = fe.make_features(pd.DataFrame(train), train_exog)
         
@@ -121,11 +196,41 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False):
             return None
             
         X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
-        model = XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
-        model.fit(X_train, y_train)
+        params = {
+            "n_estimators": 300,
+            "max_depth": 4,
+            "learning_rate": 0.05,
+            "subsample": 0.85,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 4,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "objective": "reg:squarederror",
+            "random_state": 42,
+            "n_jobs": -1,
+        }
+        if regime["zero_heavy"]:
+            params.update({"max_depth": 3, "min_child_weight": 6, "learning_rate": 0.03})
+        model = XGBRegressor(**params)
+        eval_set = None
+        fit_kwargs = {"verbose": False}
+        if len(X_train) >= 20:
+            split = max(4, int(len(X_train) * 0.2))
+            if len(X_train) - split >= 12:
+                X_fit, X_valid = X_train.iloc[:-split], X_train.iloc[-split:]
+                y_fit, y_valid = y_train.iloc[:-split], y_train.iloc[-split:]
+                eval_set = [(X_valid, y_valid)]
+                fit_kwargs.update({"eval_set": eval_set, "early_stopping_rounds": 25})
+                model.fit(X_fit, y_fit, **fit_kwargs)
+            else:
+                model.fit(X_train, y_train, **fit_kwargs)
+        else:
+            model.fit(X_train, y_train, **fit_kwargs)
         y_pred = model.predict(X_test)
         y_pred = np.maximum(y_pred, 0)
-        wmape = calculate_wmape(test.values, y_pred)
+        if regime["zero_heavy"]:
+            y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.5, 1.0))
+        wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
         return {'name': 'XGBoost', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
     except Exception as e:
         if verbose:
@@ -137,8 +242,9 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False):
         return None
 
 
-def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False):
+def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     try:
+        regime = _infer_model_regime(train, screening)
         fe = FeatureEngineer()
         X_train, y_train = fe.make_features(pd.DataFrame(train), train_exog)
         
@@ -151,11 +257,39 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False):
             return None
             
         X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
-        model = LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
-        model.fit(X_train, y_train)
+        params = {
+            "n_estimators": 300,
+            "max_depth": -1,
+            "num_leaves": 31,
+            "learning_rate": 0.05,
+            "subsample": 0.85,
+            "colsample_bytree": 0.8,
+            "min_child_samples": 10,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "random_state": 42,
+            "n_jobs": -1,
+        }
+        if regime["zero_heavy"]:
+            params.update({"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 15})
+        model = LGBMRegressor(**params)
+        fit_kwargs = {"verbose": -1}
+        if len(X_train) >= 20:
+            split = max(4, int(len(X_train) * 0.2))
+            if len(X_train) - split >= 12:
+                X_fit, X_valid = X_train.iloc[:-split], X_train.iloc[-split:]
+                y_fit, y_valid = y_train.iloc[:-split], y_train.iloc[-split:]
+                fit_kwargs.update({"eval_set": [(X_valid, y_valid)]})
+                model.fit(X_fit, y_fit, **fit_kwargs)
+            else:
+                model.fit(X_train, y_train, **fit_kwargs)
+        else:
+            model.fit(X_train, y_train, **fit_kwargs)
         y_pred = model.predict(X_test)
         y_pred = np.maximum(y_pred, 0)
-        wmape = calculate_wmape(test.values, y_pred)
+        if regime["zero_heavy"]:
+            y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.5, 1.0))
+        wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
         return {'name': 'LightGBM', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
     except Exception as e:
         if verbose:
@@ -163,18 +297,26 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False):
             import traceback
             traceback.print_exc()
         else:
-            log_fn(f"SPU {spu} 开始模型竞赛，窗口 {len(train)} 周训练 / {len(test)} 周验证。")
+            print(f"LightGBM 澶辫触: {e}")
         return None
 
 
-def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False):
+def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     try:
+        regime = _infer_model_regime(train, screening)
         exog = train_exog.values if train_exog is not None else None
+        seasonal = regime["history_weeks"] >= 52 and not regime["zero_heavy"]
+        if regime["history_weeks"] >= 104:
+            m = 52
+        elif regime["history_weeks"] >= 26:
+            m = 13
+        else:
+            m = 1
         model = pm.auto_arima(
             train.values,
             exogenous=exog,
-            seasonal=True,
-            m=52,
+            seasonal=seasonal and m > 1,
+            m=m,
             trace=False,
             error_action='ignore',
             suppress_warnings=True,
@@ -183,7 +325,9 @@ def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False):
         test_exog_vals = test_exog.values if test_exog is not None else None
         y_pred, _ = model.predict(n_periods=len(test), exogenous=test_exog_vals, return_conf_int=False)
         y_pred = np.maximum(y_pred, 0)
-        wmape = calculate_wmape(test.values, y_pred)
+        if regime["zero_heavy"]:
+            y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.2, 1.0))
+        wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
         return {'name': 'AutoARIMA', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
     except Exception as e:
         if verbose:
@@ -199,7 +343,58 @@ def _emit_model_log(log_fn, message):
     else:
         print(message)
 
-def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, verbose=False, log_fn=None):
+def run_seasonal_naive(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    try:
+        clean = _series_to_float_series(train)
+        if clean.empty:
+            return None
+
+        regime = _infer_model_regime(clean, screening)
+        if regime["history_weeks"] >= 52:
+            season_length = 52
+        elif regime["history_weeks"] >= 26:
+            season_length = 13
+        else:
+            season_length = max(4, min(8, regime["history_weeks"]))
+
+        if season_length <= 1:
+            forecast = np.full(len(test), float(clean.mean()) if len(clean) > 0 else 0.0)
+        elif len(clean) >= season_length:
+            tail = clean.iloc[-season_length:].to_numpy()
+            forecast = np.resize(tail, len(test))
+        else:
+            forecast = np.full(len(test), float(clean.mean()) if len(clean) > 0 else 0.0)
+
+        if regime["zero_heavy"]:
+            forecast = np.minimum(forecast, max(regime["recent_mean"] * 1.3, 1.0))
+
+        forecast = np.maximum(forecast, 0)
+        wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        return {"name": "SeasonalNaive", "wmape": wmape, "preds": forecast, "model": None, "params": {"season_length": season_length}}
+    except Exception as e:
+        if verbose:
+            print(f"SeasonalNaive 澶辫触: {e}")
+        return None
+
+
+def run_zero_aware_naive(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    try:
+        forecast = _build_zero_aware_forecast(train, len(test), screening)
+        wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        return {
+            "name": "ZeroAwareNaive",
+            "wmape": wmape,
+            "preds": forecast,
+            "model": None,
+            "params": {"strategy": "zero_aware"},
+        }
+    except Exception as e:
+        if verbose:
+            print(f"ZeroAwareNaive 澶辫触: {e}")
+        return None
+
+
+def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, verbose=False, log_fn=None, screening=None):
     """
     运行所有预测模型，并记录每个模型的效果。
     """
@@ -209,7 +404,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
     _emit_model_log(log_fn, "=" * 70)
 
     _emit_model_log(log_fn, "运行 Prophet...")
-    prophet_result = run_prophet(train, test, train_exog, test_exog, verbose)
+    prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
     if prophet_result:
         models.append(prophet_result)
         _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
@@ -217,7 +412,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         _emit_model_log(log_fn, "Prophet: 失败")
 
     _emit_model_log(log_fn, "运行 XGBoost...")
-    xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose)
+    xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose, screening=screening)
     if xgboost_result:
         models.append(xgboost_result)
         _emit_model_log(log_fn, f"XGBoost: WMAPE={xgboost_result['wmape']:.2%}")
@@ -225,7 +420,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         _emit_model_log(log_fn, "XGBoost: 失败")
 
     _emit_model_log(log_fn, "运行 LightGBM...")
-    lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose)
+    lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose, screening=screening)
     if lightgbm_result:
         models.append(lightgbm_result)
         _emit_model_log(log_fn, f"LightGBM: WMAPE={lightgbm_result['wmape']:.2%}")
@@ -233,7 +428,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         _emit_model_log(log_fn, "LightGBM: 失败")
 
     _emit_model_log(log_fn, "运行 AutoARIMA...")
-    autoarima_result = run_auto_arima(train, test, train_exog, test_exog, verbose)
+    autoarima_result = run_auto_arima(train, test, train_exog, test_exog, verbose, screening=screening)
     if autoarima_result:
         models.append(autoarima_result)
         _emit_model_log(log_fn, f"AutoARIMA: WMAPE={autoarima_result['wmape']:.2%}")
@@ -249,7 +444,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         _emit_model_log(log_fn, "运行融合算法...")
 
         avg_forecast = np.mean([m['preds'] for m in models], axis=0)
-        avg_wmape = calculate_wmape(test, avg_forecast)
+        avg_wmape = calculate_wmape(test, avg_forecast, min_non_zero_points=4)
         models.append({
             'name': 'Ensemble-Avg',
             'preds': avg_forecast,
@@ -258,7 +453,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         })
         _emit_model_log(log_fn, f"Ensemble-Avg: WMAPE={avg_wmape:.2%}")
 
-        weights = [1 / m['wmape'] if m['wmape'] > 0 else 0 for m in models if 'preds' in m]
+        weights = [1 / m['wmape'] if np.isfinite(m['wmape']) and m['wmape'] > 0 else 0 for m in models if 'preds' in m]
         if sum(weights) > 0:
             weights = [w / sum(weights) for w in weights]
             base_models_for_weighted = [m for m in models if m['name'] not in ['Ensemble-Avg', 'Ensemble-Weighted']]
@@ -267,7 +462,7 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
                 axis=0,
                 weights=weights[:len(base_models_for_weighted)],
             )
-            weighted_wmape = calculate_wmape(test, weighted_forecast)
+            weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
             models.append({
                 'name': 'Ensemble-Weighted',
                 'preds': weighted_forecast,
@@ -279,6 +474,16 @@ def run_all_models(train, test, mode='smart', train_exog=None, test_exog=None, v
         _emit_model_log(log_fn, "融合算法运行完成")
     else:
         _emit_model_log(log_fn, "基础模型不足 2 个，跳过融合算法")
+
+    zero_naive_result = run_zero_aware_naive(train, test, train_exog, test_exog, verbose, screening=screening)
+    if zero_naive_result:
+        models.append(zero_naive_result)
+        _emit_model_log(log_fn, f"ZeroAwareNaive: WMAPE={zero_naive_result['wmape']:.2%}")
+
+    seasonal_naive_result = run_seasonal_naive(train, test, train_exog, test_exog, verbose, screening=screening)
+    if seasonal_naive_result:
+        models.append(seasonal_naive_result)
+        _emit_model_log(log_fn, f"SeasonalNaive: WMAPE={seasonal_naive_result['wmape']:.2%}")
 
     _emit_model_log(log_fn, "=" * 70)
 
@@ -392,16 +597,57 @@ def predict_future(series, winner, n_steps, exog_series=None, future_exog=None, 
             X_future, _ = fe.make_features_for_prediction(future_df)
         preds = model.predict(X_future)
         return np.maximum(preds, 0)
+    elif winner['name'] == 'SeasonalNaive':
+        clean = _series_to_float_series(series)
+        if clean.empty:
+            return np.zeros(n_steps)
+        if len(clean) >= 52:
+            season_length = 52
+        elif len(clean) >= 26:
+            season_length = 13
+        else:
+            season_length = max(4, min(8, len(clean)))
+        tail = clean.iloc[-season_length:].to_numpy() if len(clean) >= season_length else np.full(n_steps, float(clean.mean()))
+        preds = np.resize(tail, n_steps)
+        return np.maximum(preds, 0)
+    elif winner['name'] == 'ZeroAwareNaive':
+        return _build_zero_aware_forecast(series, n_steps, None)
     else:
         return np.array([series.mean()] * n_steps)
 
 
-def safe_predictions(preds, fallback_value, model_name):
+def safe_predictions(preds, fallback_value, model_name, history_series=None):
     preds = np.asarray(preds).flatten().copy()
     nan_count = np.sum(np.isnan(preds))
     if nan_count > 0:
         preds[np.isnan(preds)] = fallback_value
     preds = np.maximum(preds, 0)
+    if history_series is not None and len(history_series) > 0:
+        recent = pd.Series(history_series).tail(12).astype(float)
+        recent_non_zero = recent[recent > 0]
+        recent_anchor = float(recent_non_zero.median()) if not recent_non_zero.empty else float(fallback_value)
+        recent_peak = float(recent.max()) if not recent.empty else float(fallback_value)
+        recent_std = float(recent.std(ddof=0)) if len(recent) > 1 else 0.0
+        upper_cap = max(
+            recent_anchor * 3.0,
+            recent_peak * 2.0,
+            recent_anchor + recent_std * 3.0,
+            float(fallback_value) * 4.0,
+            1.0,
+        )
+        preds = np.minimum(preds, upper_cap)
+        if len(preds) > 1 and recent_anchor > 0:
+            recent_changes = np.abs(np.diff(recent.to_numpy())) if len(recent) > 1 else np.array([0.0])
+            max_step = max(float(np.nanmedian(recent_changes)) * 3.0, recent_std * 2.0, recent_anchor * 0.8, 1.0)
+            smoothed = preds.copy()
+            for idx in range(1, len(smoothed)):
+                if preds[idx] <= 0:
+                    smoothed[idx] = 0.0
+                    continue
+                lower_bound = max(smoothed[idx - 1] - max_step, 0.0)
+                upper_bound_step = smoothed[idx - 1] + max_step
+                smoothed[idx] = float(np.clip(smoothed[idx], lower_bound, min(upper_cap, upper_bound_step)))
+            preds = smoothed
     return preds
 
 

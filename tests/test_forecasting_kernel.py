@@ -36,7 +36,7 @@ def test_kernel_process_single_spu_is_local(monkeypatch):
         def print_forecast_summary(self, profile, future_dates, forecast_values):
             return None
 
-    def fake_run_all_models(train, test, mode="smart", train_exog=None, test_exog=None, verbose=False):
+    def fake_run_all_models(train, test, mode="smart", train_exog=None, test_exog=None, verbose=False, log_fn=None):
         return (
             [
                 {
@@ -52,7 +52,11 @@ def test_kernel_process_single_spu_is_local(monkeypatch):
     monkeypatch.setattr(kernel, "SPUProfiler", DummyProfiler)
     monkeypatch.setattr(kernel, "run_all_models", fake_run_all_models)
     monkeypatch.setattr(kernel, "predict_future", lambda *args, **kwargs: [12.0] * 16)
-    monkeypatch.setattr(kernel, "safe_predictions", lambda preds, fallback, model_name: pd.Series(preds).to_numpy())
+    monkeypatch.setattr(
+        kernel,
+        "safe_predictions",
+        lambda preds, fallback, model_name, history_series=None: pd.Series(preds).to_numpy(),
+    )
 
     def fake_dynamic_shares(*args, **kwargs):
         future_dates = args[-1]
@@ -169,6 +173,18 @@ def test_kernel_get_data_from_db_uses_local_query_path(monkeypatch):
     assert engine.disposed is True
 
 
+def test_kernel_training_query_keeps_expected_identifiers():
+    import src.forecasting.kernel as kernel
+
+    query = kernel._build_training_data_query()
+
+    assert "查询订单利润_msku_cny_5年版" in query
+    assert "查询订单利润_msku_cny_商品基础信息_5年版" in query
+    assert "sum(a.volume) as 销量" in query
+    assert "sum(销量) as sales" in query
+    assert "?" not in query
+
+
 def test_kernel_does_not_import_root_engine_or_utils():
     import inspect
     import src.forecasting.kernel as kernel
@@ -176,3 +192,42 @@ def test_kernel_does_not_import_root_engine_or_utils():
     source = inspect.getsource(kernel)
     assert "from algorithm_engine import" not in source
     assert "from config_and_utils import" not in source
+
+
+def test_kernel_skips_sparse_validation_windows(monkeypatch):
+    import src.forecasting.kernel as kernel
+
+    class DummyProfiler:
+        def __init__(self, verbose=False):
+            self.verbose = verbose
+
+        def analyze(self, spu, series, original_series, exog_series):
+            return SimpleNamespace(spu=spu)
+
+    monkeypatch.setattr(kernel, "SPUProfiler", DummyProfiler)
+    monkeypatch.setattr(kernel, "clean_series", lambda series: series)
+    monkeypatch.setattr(kernel, "get_current_week_end", lambda: pd.Timestamp("2025-06-01"))
+
+    df_spu = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-05", periods=20, freq="W"),
+            "spu": ["SPU001"] * 20,
+            "sku": ["SKU1"] * 20,
+            "principal_names": ["P1"] * 20,
+            "sales": [10] * 12 + [0, 0, 0, 0, 10, 0, 0, 0],
+        }
+    )
+
+    result_df, message, viz, profile = kernel.process_single_spu(
+        "SPU001",
+        df_spu,
+        mode="smart",
+        exog_cols=[],
+        collect_viz=False,
+        verbose=False,
+    )
+
+    assert result_df is None
+    assert message == "验证窗口非零样本不足，已跳过标准预测链"
+    assert viz is None
+    assert profile is None

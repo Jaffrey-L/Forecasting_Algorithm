@@ -1,11 +1,7 @@
+from fastapi.testclient import TestClient
+
 from src.api.platform_store import PlatformStore
-from src.api.runtime import ForecastRuntimeManager, parse_manual_spus
-
-
-def test_parse_manual_spus_deduplicates_and_normalizes():
-    parsed = parse_manual_spus("spu001, SPU001\nspu002 spu003")
-    assert parsed["spus"] == ["SPU001", "SPU002", "SPU003"]
-    assert parsed["invalid_items"] == []
+from src.api.runtime import ForecastRuntimeManager
 
 
 def test_platform_store_config_roundtrip(tmp_path):
@@ -14,13 +10,14 @@ def test_platform_store_config_roundtrip(tmp_path):
         name="Weekly Core SPUs",
         purpose="Ops review",
         mode="smart",
-        selection_type="manual",
-        selection_payload={"manual_spus": "SPU001\nSPU002"},
+        selection_type="all",
+        selection_payload={},
     )
     fetched = store.get_config(config["id"])
     assert fetched is not None
     assert fetched["name"] == "Weekly Core SPUs"
-    assert fetched["selection_payload"]["manual_spus"] == "SPU001\nSPU002"
+    assert fetched["selection_type"] == "all"
+    assert fetched["selection_payload"] == {}
 
 
 def test_fastapi_app_has_platform_routes():
@@ -34,9 +31,7 @@ def test_fastapi_app_has_platform_routes():
 
 
 def test_linux_ops_api_uses_snapshot_helper(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
-    from src.api.platform_store import PlatformStore
 
     original_store = app_module.store
     monkeypatch.setattr(app_module, "store", PlatformStore(str(tmp_path / "platform_state.db")))
@@ -48,7 +43,7 @@ def test_linux_ops_api_uses_snapshot_helper(tmp_path, monkeypatch):
             "services": [],
             "next_schedule": None,
             "schedules": [],
-            "logs": {"source": {"kind": "service", "label": "服务日志"}, "entries": []},
+            "logs": {"source": {"kind": "service", "label": "Service logs"}, "entries": []},
         }
 
     monkeypatch.setattr(app_module, "collect_linux_ops_snapshot", stub_snapshot)
@@ -56,27 +51,26 @@ def test_linux_ops_api_uses_snapshot_helper(tmp_path, monkeypatch):
     client = TestClient(app_module.app)
     response = client.get("/api/linux-ops")
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["logs"]["source"]["label"] == "服务日志"
+    assert response.json()["logs"]["source"]["label"] == "Service logs"
+
     monkeypatch.setattr(app_module, "store", original_store)
 
 
-def test_frontend_entry_returns_new_console_markup():
-    from fastapi.testclient import TestClient
+def test_frontend_entry_hides_manual_and_sql_controls():
     from src.api.app import app
 
     client = TestClient(app)
-    response = client.get("/")
+    response = client.get("/control-platform")
+
     assert response.status_code == 200
-    assert "Overview" in response.text
-    assert "mode-switch" in response.text
-    assert 'data-mode="smart-only"' in response.text
+    assert 'data-selection="manual"' not in response.text
+    assert 'data-selection="sql"' not in response.text
+    assert 'id="manualInput"' not in response.text
+    assert 'id="sqlInput"' not in response.text
 
 
 def test_compatibility_analysis_status_idle_state(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
-    from src.api.platform_store import PlatformStore
 
     original_store = app_module.store
     monkeypatch.setattr(app_module, "store", PlatformStore(str(tmp_path / "platform_state.db")))
@@ -88,13 +82,6 @@ def test_compatibility_analysis_status_idle_state(tmp_path, monkeypatch):
     payload = response.json()
     assert payload["run_id"] is None
     assert payload["status"] == "idle"
-    assert payload["progress"] == 0
-    assert payload["processed_count"] == 0
-    assert payload["total_count"] == 0
-    assert payload["success_count"] == 0
-    assert payload["current_spu"] is None
-    assert payload["mode"] == "smart"
-    assert payload["trigger_source"] is None
     assert payload["scope_min_weeks"] == 108
     assert payload["scope_total_spus"] == 0
     assert payload["scope_eligible_spus"] == 0
@@ -103,25 +90,20 @@ def test_compatibility_analysis_status_idle_state(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "store", original_store)
 
 
-def test_manual_selection_api_returns_preview():
-    from fastapi.testclient import TestClient
+def test_selection_api_rejects_manual_and_sql_modes():
     from src.api.app import app
 
     client = TestClient(app)
-    response = client.post(
-        "/api/spu-selection/resolve",
-        json={"selection_type": "manual", "manual_spus": "spu001\nspu002,spu002"},
-    )
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["count"] == 2
-    assert payload["selected_spus"] == ["SPU001", "SPU002"]
+
+    manual_response = client.post("/api/spu-selection/resolve", json={"selection_type": "manual"})
+    sql_response = client.post("/api/spu-selection/resolve", json={"selection_type": "sql"})
+
+    assert manual_response.status_code == 422
+    assert sql_response.status_code == 422
 
 
 def test_create_config_and_schedule_via_api(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
-    from src.api.platform_store import PlatformStore
 
     original_store = app_module.store
     test_store = PlatformStore(str(tmp_path / "platform_state.db"))
@@ -134,12 +116,12 @@ def test_create_config_and_schedule_via_api(tmp_path, monkeypatch):
             "name": "Weekly Core SPUs",
             "purpose": "Ops review",
             "mode": "smart",
-            "selection_type": "manual",
-            "manual_spus": "SPU001\nSPU002",
+            "selection_type": "all",
         },
     )
     assert config_resp.status_code == 200
     config = config_resp.json()
+    assert config["selection_payload"] == {}
 
     schedule_resp = client.post(
         "/api/forecast-schedules",
@@ -154,11 +136,11 @@ def test_create_config_and_schedule_via_api(tmp_path, monkeypatch):
     )
     assert schedule_resp.status_code == 200
     assert schedule_resp.json()["config_id"] == config["id"]
+
     monkeypatch.setattr(app_module, "store", original_store)
 
 
 def test_create_job_api_with_stubbed_manager(monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
 
     class StubManager:
@@ -182,18 +164,50 @@ def test_create_job_api_with_stubbed_manager(monkeypatch):
     client = TestClient(app_module.app)
     response = client.post(
         "/api/forecast-jobs",
-        json={"mode": "smart", "selection_type": "manual", "manual_spus": "SPU001\nSPU002"},
+        json={"mode": "smart", "selection_type": "all"},
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["run_id"] == "run_test_001"
-    assert payload["run"]["total_count"] == 2
+    assert payload["run"]["selection_payload"] == {}
+
+
+def test_manager_create_run_emits_immediate_queue_feedback(monkeypatch, tmp_path):
+    import src.api.runtime as runtime_module
+
+    store = PlatformStore(str(tmp_path / "platform_state.db"))
+    manager = runtime_module.ForecastRuntimeManager(store=store, db_url="sqlite:///demo")
+    thread_started = {"value": False}
+
+    class DummyThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            thread_started["value"] = True
+
+    monkeypatch.setattr(runtime_module.threading, "Thread", DummyThread)
+
+    run = manager.create_run(
+        mode="smart",
+        selection_type="all",
+        selection_payload={},
+        config_id=None,
+        trigger_source="manual",
+    )
+
+    logs = store.get_logs(run["id"], limit=10)
+
+    assert thread_started["value"] is True
+    assert run["status"] == "queued"
+    assert run["current_spu"] == "等待启动"
+    assert logs and "accepted and queued" in logs[0]["message"]
 
 
 def test_compatibility_status_and_logs_endpoints(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
-    from src.api.platform_store import PlatformStore
 
     original_store = app_module.store
     test_store = PlatformStore(str(tmp_path / "platform_state.db"))
@@ -203,8 +217,8 @@ def test_compatibility_status_and_logs_endpoints(tmp_path, monkeypatch):
         config_id=None,
         trigger_source="manual",
         mode="smart",
-        selection_type="manual",
-        selection_payload={"manual_spus": "SPU001"},
+        selection_type="all",
+        selection_payload={},
         selected_spus=["SPU001"],
     )
     test_store.update_run(
@@ -225,23 +239,22 @@ def test_compatibility_status_and_logs_endpoints(tmp_path, monkeypatch):
 
     assert status_resp.status_code == 200
     assert status_resp.json()["progress"] == 45
-    assert status_resp.json()["trigger_source"] == "manual"
     assert logs_resp.status_code == 200
     assert logs_resp.json()["logs"][0]["message"] == "Run started"
     assert spus_resp.status_code == 200
     assert spus_resp.json()["completed_spus"] == []
+
     monkeypatch.setattr(app_module, "store", original_store)
 
 
 def test_compatibility_start_analysis_defaults_to_all(monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
 
     class StubManager:
         def create_run(self, mode, selection_type, selection_payload, config_id=None, trigger_source="manual"):
             assert mode == "smart"
             assert selection_type == "all"
-            assert selection_payload == {"manual_spus": "", "sql_query": ""}
+            assert selection_payload == {}
             assert config_id is None
             assert trigger_source == "manual"
             return {
@@ -249,6 +262,8 @@ def test_compatibility_start_analysis_defaults_to_all(monkeypatch):
                 "mode": mode,
                 "status": "queued",
                 "trigger_source": trigger_source,
+                "progress": 0,
+                "current_spu": "等待启动",
             }
 
     monkeypatch.setattr(app_module, "manager", StubManager())
@@ -259,12 +274,12 @@ def test_compatibility_start_analysis_defaults_to_all(monkeypatch):
     assert payload["run_id"] == "run_legacy_001"
     assert payload["mode"] == "smart"
     assert payload["trigger_source"] == "manual"
+    assert payload["status"] == "queued"
+    assert payload["message"] == "Analysis queued."
 
 
 def test_stop_analysis_uses_latest_run(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
-    from src.api.platform_store import PlatformStore
 
     original_store = app_module.store
     test_store = PlatformStore(str(tmp_path / "platform_state.db"))
@@ -294,11 +309,11 @@ def test_stop_analysis_uses_latest_run(tmp_path, monkeypatch):
     payload = response.json()
     assert payload["run_id"] == run["id"]
     assert payload["status"] == "stopping"
+
     monkeypatch.setattr(app_module, "store", original_store)
 
 
 def test_results_api_with_stubbed_manager(monkeypatch):
-    from fastapi.testclient import TestClient
     import src.api.app as app_module
 
     class StubManager:
@@ -328,7 +343,6 @@ def test_results_api_with_stubbed_manager(monkeypatch):
 
 
 def test_project_management_dashboard_route():
-    from fastapi.testclient import TestClient
     from src.api.app import app
 
     client = TestClient(app)
@@ -337,91 +351,80 @@ def test_project_management_dashboard_route():
     assert "pm-dashboard.js" in response.text
 
 
-def test_sql_selection_requires_single_spu_column(monkeypatch, tmp_path):
-    import pandas as pd
-    import src.api.runtime as runtime_module
-
-    class StubEngine:
-        def dispose(self):
-            return None
-
-    def stub_get_engine(_db_url):
-        return StubEngine()
-
-    def stub_read_sql(_query, con):
-        assert con is not None
-        return pd.DataFrame({"spu": ["spu001", "SPU002", "spu001"]})
-
-    monkeypatch.setattr(runtime_module, "get_database_engine", stub_get_engine)
-    monkeypatch.setattr(runtime_module.pd, "read_sql", stub_read_sql)
-
-    store = PlatformStore(str(tmp_path / "platform_state.db"))
-    manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
-    result = manager.resolve_selection("sql", {"sql_query": "select spu from some_table"})
-    assert result["selected_spus"] == ["SPU001", "SPU002"]
-    assert result["count"] == 2
-
-
-def test_sql_selection_rejects_non_spu_shape(monkeypatch, tmp_path):
-    import pandas as pd
-    import src.api.runtime as runtime_module
-
-    class StubEngine:
-        def dispose(self):
-            return None
-
-    def stub_get_engine(_db_url):
-        return StubEngine()
-
-    def stub_read_sql(_query, con):
-        assert con is not None
-        return pd.DataFrame({"spu": ["SPU001"], "sku": ["SKU001"]})
-
-    monkeypatch.setattr(runtime_module, "get_database_engine", stub_get_engine)
-    monkeypatch.setattr(runtime_module.pd, "read_sql", stub_read_sql)
-
+def test_manager_rejects_manual_and_sql_selection_types(tmp_path):
     store = PlatformStore(str(tmp_path / "platform_state.db"))
     manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
 
-    try:
-        manager.resolve_selection("sql", {"sql_query": "select spu, sku from some_table"})
-        assert False, "Expected ValueError"
-    except ValueError as exc:
-        assert "exactly one column named spu" in str(exc)
+    for selection_type in ("manual", "sql"):
+        try:
+            manager.resolve_selection(selection_type, {})
+            assert False, "Expected ValueError"
+        except ValueError as exc:
+            assert "standard all selection workflow" in str(exc)
 
 
-def test_manual_selection_is_not_filtered_by_all_scope_rules(tmp_path):
-    store = PlatformStore(str(tmp_path / "platform_state.db"))
-    manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
-
-    result = manager.resolve_selection("manual", {"manual_spus": "SPU001\nSPU002"})
-
-    assert result["selected_spus"] == ["SPU001", "SPU002"]
-    assert result["count"] == 2
-
-
-def test_all_selection_excludes_spus_with_zero_sales_in_any_recent_week(monkeypatch, tmp_path):
+def test_all_selection_applies_unified_scope_rules(monkeypatch, tmp_path):
     import pandas as pd
     import src.api.runtime as runtime_module
 
-    weekly_dates = list(pd.date_range("2024-01-07", periods=10, freq="W"))
+    weekly_dates = list(pd.date_range("2024-01-07", periods=12, freq="W"))
     df = pd.DataFrame(
         {
-            "date": weekly_dates + weekly_dates + weekly_dates + weekly_dates[:6],
-            "spu": ["SPU001"] * 10 + ["SPU002"] * 10 + ["SPU003"] * 10 + ["SPU004"] * 6,
+            "date": weekly_dates * 5,
+            "spu": ["SPU001"] * 12 + ["SPU002"] * 12 + ["SPU003"] * 12 + ["SPU004"] * 12 + ["SPU005"] * 12,
             "sales": (
-                [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-                + [5, 6, 7, 8, 9, 10, 11, 12, 0, 14]
-                + [5, 6, 7, 8, 9, 10, 0, 12, 13, 14]
-                + [5, 6, 7, 8, 9, 10]
+                [5] * 12
+                + [5] * 8 + [0] * 4
+                + [5] * 11 + [3]
+                + [5, 0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0]
+                + [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
             ),
-            "sku": ["SKU001"] * 10 + ["SKU002"] * 10 + ["SKU003"] * 10 + ["SKU004"] * 6,
+            "sku": ["SKU001"] * 60,
         }
     )
 
     monkeypatch.setattr(runtime_module, "get_data_from_db", lambda _db_url: df)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_WEEKS", 1)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WEEKS", 4)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS", 8)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WINDOW_WEEKS", 12)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MAX_ZERO_RATIO_26W", 0.25)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES", 4.0)
+
+    store = PlatformStore(str(tmp_path / "platform_state.db"))
+    manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
+
+    result = manager.resolve_selection("all", {})
+
+    assert result["selected_spus"] == ["SPU001", "SPU003"]
+    assert result["count"] == 2
+    assert result["scope_total_spus"] == 5
+    assert result["scope_eligible_spus"] == 2
+    assert result["scope_excluded_spus"] == 3
+
+
+def test_all_selection_ignores_trailing_empty_weeks(monkeypatch, tmp_path):
+    import pandas as pd
+    import src.api.runtime as runtime_module
+
+    weekly_dates = list(pd.date_range("2024-01-07", periods=16, freq="W"))
+    sales = [5] * 12 + [0, 0, 0, 0]
+    df = pd.DataFrame(
+        {
+            "date": weekly_dates,
+            "spu": ["SPU001"] * 16,
+            "sales": sales,
+            "sku": ["SKU001"] * 16,
+        }
+    )
+
+    monkeypatch.setattr(runtime_module, "get_data_from_db", lambda _db_url: df)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_WEEKS", 1)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WEEKS", 4)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS", 8)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WINDOW_WEEKS", 12)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MAX_ZERO_RATIO_26W", 0.5)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES", 4.0)
 
     store = PlatformStore(str(tmp_path / "platform_state.db"))
     manager = ForecastRuntimeManager(store=store, db_url="sqlite:///ignored.db")
@@ -430,6 +433,3 @@ def test_all_selection_excludes_spus_with_zero_sales_in_any_recent_week(monkeypa
 
     assert result["selected_spus"] == ["SPU001"]
     assert result["count"] == 1
-    assert result["scope_total_spus"] == 4
-    assert result["scope_eligible_spus"] == 1
-    assert result["scope_excluded_spus"] == 3

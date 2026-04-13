@@ -12,7 +12,11 @@ import pandas as pd
 import numpy as np
 import json
 from datetime import datetime
+from typing import Any, Dict, Tuple
 from sqlalchemy import create_engine, text
+
+PASS_WMAPE_THRESHOLD = 0.15
+WARNING_WMAPE_THRESHOLD = 0.30
 
 def get_forecast_data(db_url):
     """从数据库获取预测数据"""
@@ -144,6 +148,234 @@ def calculate_wmape(y_true, y_pred):
     if not np.any(mask):
         return 0.0
     return np.sum(np.abs(y_true[mask] - y_pred[mask])) / np.sum(np.abs(y_true[mask]))
+
+def _load_json_object(raw_value: Any) -> Dict[str, Any]:
+    if raw_value is None or (isinstance(raw_value, float) and np.isnan(raw_value)):
+        return {}
+    if isinstance(raw_value, dict):
+        return raw_value
+    if not isinstance(raw_value, str):
+        return {}
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def classify_quality_level(wmape: Any) -> str:
+    if wmape is None or (isinstance(wmape, float) and np.isnan(wmape)):
+        return "unknown"
+    wmape = float(wmape)
+    if wmape <= PASS_WMAPE_THRESHOLD:
+        return "pass"
+    if wmape <= WARNING_WMAPE_THRESHOLD:
+        return "warning"
+    return "bad"
+
+
+def get_quality_badge(wmape: Any) -> Tuple[str, str]:
+    quality_level = classify_quality_level(wmape)
+    if quality_level == "pass":
+        return "good", "达标"
+    if quality_level == "warning":
+        return "warning", "预警"
+    if quality_level == "bad":
+        return "bad", "待治理"
+    return "warning", "待判定"
+
+
+def classify_sample_level(training_weeks: Any) -> str:
+    if training_weeks is None or (isinstance(training_weeks, float) and np.isnan(training_weeks)):
+        return "unknown"
+    training_weeks = int(training_weeks)
+    if training_weeks >= 104:
+        return "strong"
+    if training_weeks >= 52:
+        return "usable"
+    if training_weeks >= 24:
+        return "weak"
+    return "insufficient"
+
+
+def expand_sku_accuracy_rows(spu_rows: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    detail_rows = []
+    summary_rows = []
+
+    for _, row in spu_rows.iterrows():
+        row_dict = row.to_dict()
+        payload = _load_json_object(row_dict.get("sku_accuracy_json"))
+        base_summary = {
+            "spu": row_dict.get("spu"),
+            "run_date": row_dict.get("run_date"),
+            "winner_algo": row_dict.get("winner_algo"),
+            "validation_wmape": row_dict.get("validation_wmape"),
+            "training_weeks": row_dict.get("training_weeks"),
+            "data_end_date": row_dict.get("data_end_date"),
+        }
+
+        if not payload:
+            summary_rows.append(
+                {
+                    **base_summary,
+                    "sku_count": 0,
+                    "sku_weighted_wmape": np.nan,
+                    "max_sku_wmape": np.nan,
+                    "quality_level": classify_quality_level(row_dict.get("validation_wmape")),
+                    "sample_level": classify_sample_level(row_dict.get("training_weeks")),
+                    "error": "missing_sku_accuracy",
+                }
+            )
+            continue
+
+        if "error" in payload:
+            summary_rows.append(
+                {
+                    **base_summary,
+                    "sku_count": 0,
+                    "sku_weighted_wmape": np.nan,
+                    "max_sku_wmape": np.nan,
+                    "quality_level": classify_quality_level(row_dict.get("validation_wmape")),
+                    "sample_level": classify_sample_level(row_dict.get("training_weeks")),
+                    "error": payload.get("error"),
+                }
+            )
+            continue
+
+        weighted_error = 0.0
+        total_weight = 0.0
+        max_sku_wmape = 0.0
+        valid_sku_count = 0
+
+        for sku, metrics in payload.items():
+            if not isinstance(metrics, dict):
+                continue
+            sku_wmape = float(metrics.get("wmape", 0.0) or 0.0)
+            sku_weight = float(metrics.get("weight_in_spu", 0.0) or 0.0)
+            total_sales = float(metrics.get("total_sales", 0.0) or 0.0)
+            weighted_error += sku_wmape * sku_weight
+            total_weight += sku_weight
+            max_sku_wmape = max(max_sku_wmape, sku_wmape)
+            valid_sku_count += 1
+            detail_rows.append(
+                {
+                    "spu": row_dict.get("spu"),
+                    "run_date": row_dict.get("run_date"),
+                    "winner_algo": row_dict.get("winner_algo"),
+                    "validation_wmape": row_dict.get("validation_wmape"),
+                    "sku": sku,
+                    "wmape": sku_wmape,
+                    "total_sales": total_sales,
+                    "weight_in_spu": sku_weight,
+                    "quality_level": classify_quality_level(sku_wmape),
+                    "sample_level": classify_sample_level(row_dict.get("training_weeks")),
+                }
+            )
+
+        summary_rows.append(
+            {
+                **base_summary,
+                "sku_count": valid_sku_count,
+                "sku_weighted_wmape": (weighted_error / total_weight) if total_weight > 0 else np.nan,
+                "max_sku_wmape": max_sku_wmape if valid_sku_count else np.nan,
+                "quality_level": classify_quality_level(row_dict.get("validation_wmape")),
+                "sample_level": classify_sample_level(row_dict.get("training_weeks")),
+                "error": None,
+            }
+        )
+
+    return pd.DataFrame(detail_rows), pd.DataFrame(summary_rows)
+
+
+def summarize_accuracy_opportunities(spu_rows: pd.DataFrame) -> pd.DataFrame:
+    _detail_df, summary_df = expand_sku_accuracy_rows(spu_rows)
+    if summary_df.empty:
+        return summary_df
+
+    summary_df = summary_df.copy()
+    summary_df["needs_rule_review"] = (
+        summary_df["sample_level"].isin(["weak", "insufficient"])
+        | summary_df["quality_level"].isin(["warning", "bad"])
+        | summary_df["error"].notna()
+    )
+    summary_df["likely_primary_cause"] = np.where(
+        summary_df["sample_level"].isin(["weak", "insufficient"]),
+        "sample",
+        np.where(summary_df["quality_level"].isin(["warning", "bad"]), "algorithm_or_features", "stable"),
+    )
+    summary_df["recommended_action"] = np.where(
+        summary_df["error"].notna(),
+        "backfill_sku_accuracy",
+        np.where(
+            summary_df["sample_level"].isin(["weak", "insufficient"]),
+            "sample_rule_filter",
+            np.where(
+                summary_df["quality_level"].isin(["warning", "bad"]),
+                "algorithm_feature_review",
+                "keep_as_reference",
+            ),
+        ),
+    )
+    summary_df["is_recommended"] = (
+        summary_df["error"].isna()
+        & summary_df["quality_level"].eq("pass")
+        & summary_df["sample_level"].isin(["strong", "usable"])
+    )
+    return summary_df.sort_values(
+        by=["needs_rule_review", "validation_wmape", "sku_weighted_wmape"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def summarize_final_rates(spu_rows: pd.DataFrame) -> Dict[str, float]:
+    summary_df = summarize_accuracy_opportunities(spu_rows)
+    if summary_df.empty:
+        return {
+            "total_spu_count": 0,
+            "sample_ready_count": 0,
+            "sample_error_pass_count": 0,
+            "sample_error_fail_count": 0,
+            "sample_rate": 0.0,
+            "error_pass_rate": 0.0,
+            "error_fail_rate": 0.0,
+            "sample_pass_rate": 0.0,
+            "sample_error_pass_rate": 0.0,
+            "sample_error_fail_rate": 0.0,
+            "high_accuracy_sample_coverage_rate": 0.0,
+            "algorithm_improvable_coverage_rate": 0.0,
+        }
+
+    total_spu_count = int(len(summary_df))
+    sample_ready_mask = summary_df["sample_level"].isin(["strong", "usable"])
+    scorable_mask = summary_df["error"].isna()
+    sample_ready_count = int(sample_ready_mask.sum())
+    pass_mask = summary_df["quality_level"].eq("pass") & scorable_mask
+    fail_mask = summary_df["quality_level"].isin(["warning", "bad"]) & scorable_mask
+    sample_pass_mask = sample_ready_mask & pass_mask
+    sample_fail_mask = sample_ready_mask & fail_mask
+    sample_error_pass_count = int(sample_pass_mask.sum())
+    sample_error_fail_count = int(sample_fail_mask.sum())
+    sample_denominator = sample_ready_count if sample_ready_count > 0 else 1
+
+    return {
+        "total_spu_count": total_spu_count,
+        "sample_ready_count": sample_ready_count,
+        "sample_error_pass_count": sample_error_pass_count,
+        "sample_error_fail_count": sample_error_fail_count,
+        "sample_rate": float(sample_ready_count / total_spu_count),
+        "error_pass_rate": float(pass_mask.sum() / total_spu_count),
+        "error_fail_rate": float(fail_mask.sum() / total_spu_count),
+        "sample_pass_rate": float(sample_ready_count / total_spu_count),
+        "sample_error_pass_rate": float(sample_error_pass_count / sample_denominator),
+        "sample_error_fail_rate": float(sample_error_fail_count / sample_denominator),
+        "high_accuracy_sample_coverage_rate": float(sample_error_pass_count / total_spu_count),
+        "algorithm_improvable_coverage_rate": float(sample_error_fail_count / total_spu_count),
+    }
+
 
 def generate_html_report(accuracy_data, sku_accuracy_data, output_path):
     """生成HTML报告"""
@@ -342,6 +574,7 @@ def generate_html_report(accuracy_data, sku_accuracy_data, output_path):
             status = 'bad'
             status_text = '需改进'
         
+        status, status_text = get_quality_badge(wmape)
         html_content += f"""
                 <tr>
                     <td>{i}</td>
@@ -384,6 +617,7 @@ def generate_html_report(accuracy_data, sku_accuracy_data, output_path):
             status = 'bad'
             status_text = '需改进'
         
+        status, status_text = get_quality_badge(wmape)
         html_content += f"""
                 <tr>
                     <td>{row['spu']}</td>

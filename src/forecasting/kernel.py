@@ -20,6 +20,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 from src.forecasting.models import SPUProfiler
+from src.forecasting.sample_screening import screen_weekly_series
 from src.forecasting.predictors import (
     clean_params_for_db,
     clean_series,
@@ -64,16 +65,17 @@ def _build_training_data_query() -> str:
         else '-' end as SPU,
         sum(afn_amount+mfn_amount+promotion_discount+refund_amount+cost_of_points_granted+inventory_credit+shared_fba_liquidation_proceeds+shared_fba_liquidation_proceeds_adjustments
         +shared_amazon_shipping_reimbursement+shared_safe_t_reimbursement+shared_netco_transaction+shared_reimbursements+shared_clawbacks+shared_commingling_vat_income+gift_wrap_credits
-        +a_to_z_guarantee_claims+shared_others+shipping_cost) as 閿€鍞,
-        sum(a.volume) as 閿€閲?
-        avg(avg_net_amount) as 骞冲潎鍞环,
-        sum(ads_sd_cost+ads_sp_cost+ads_sb_cost+ads_sbv_cost) as 骞垮憡璐?        from lx_ods.鏌ヨ璁㈠崟鍒╂鼎_msku_cny_5骞寸増 a
-        left join lx_ods.鏌ヨ璁㈠崟鍒╂鼎_msku_cny_鍟嗗搧鍩虹淇℃伅_5骞寸増 b on a.__dm_key=b.__dm_key
+        +a_to_z_guarantee_claims+shared_others+shipping_cost) as 销售额,
+        sum(a.volume) as 销量,
+        avg(avg_net_amount) as 平均售价,
+        sum(ads_sd_cost+ads_sp_cost+ads_sb_cost+ads_sbv_cost) as 广告费
+        from lx_ods.查询订单利润_msku_cny_5年版 a
+        left join lx_ods.查询订单利润_msku_cny_商品基础信息_5年版 b on a.__dm_key=b.__dm_key
         group by 1,2,3,4
     )
-    select report_date as date, sum(閿€閲? as sales, SPU as spu, local_sku as sku,
+    select report_date as date, sum(销量) as sales, SPU as spu, local_sku as sku,
            max(principal_names) as principal_names,
-           ROUND(SUM(-骞垮憡璐?::NUMERIC, 2) as ad_cost, avg(骞冲潎鍞环) as price
+           ROUND(SUM(-广告费)::NUMERIC, 2) as ad_cost, avg(平均售价) as price
     from base
     where 1=1{spu_filter_sql}
     group by report_date, SPU, local_sku
@@ -86,24 +88,24 @@ def get_data_from_db(db_url):
     query = _build_training_data_query()
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
-        print("灏濊瘯杩炴帴鏁版嵁搴?..")
+        print("尝试连接数据库...")
         with engine.connect() as conn:
-            print("鏁版嵁搴撹繛鎺ユ垚鍔燂紒")
-            print("寮€濮嬫墽琛孲QL鏌ヨ...")
+            print("数据库连接成功！")
+            print("开始执行SQL查询...")
             df = pd.read_sql(text(query), con=conn)
-            print(f"SQL query succeeded, fetched {len(df)} rows")
+            print(f"SQL查询执行成功，获取到 {len(df)} 行数据")
         df.columns = [col.lower() for col in df.columns]
-        print(f"Data load complete: {len(df)} rows loaded in {time.time() - t0:.1f} seconds")
+        print(f"数据获取完成！共加载 {len(df)} 行记录，耗时: {time.time() - t0:.1f} 秒")
         return df
     except Exception as exc:
         import traceback
 
-        print(f"鏁版嵁鑾峰彇澶辫触: {exc}")
+        print(f"数据获取失败: {exc}")
         traceback.print_exc()
         return pd.DataFrame()
     finally:
         engine.dispose()
-        print("鏁版嵁搴撹繛鎺ュ凡鍏抽棴")
+        print("数据库连接已关闭")
 
 
 def process_single_spu(
@@ -147,6 +149,15 @@ def process_single_spu(
             if has_exog and exog_series is not None:
                 exog_series = exog_series.iloc[-156:]
 
+        screening = screen_weekly_series(series)
+        if screening["insufficient_data"]:
+            return None, f"数据不足 ({screening['history_weeks']}周)", None, None
+
+        if screening["recommendation"] == "zero_override" and verbose:
+            print(f"   Screening: {screening['recommendation']} | reasons={','.join(screening['reasons'])}")
+        elif screening["recommendation"] == "conservative" and verbose:
+            print(f"   Screening: {screening['recommendation']} | reasons={','.join(screening['reasons'])}")
+
         series_clean = clean_series(series)
         if len(series_clean) < 12:
             return None, "数据不足 (<12周)", None, None
@@ -155,10 +166,14 @@ def process_single_spu(
         if verbose:
             profiler.print_profile(profile)
 
-        test_len = min(10, max(4, len(series_clean) // 3))
+        test_len = min(16, max(8, len(series_clean) // 4))
         train, test = series_clean.iloc[:-test_len], series_clean.iloc[-test_len:]
         train_exog = exog_series.iloc[:-test_len] if has_exog else None
         test_exog = exog_series.iloc[-test_len:] if has_exog else None
+        validation_non_zero_points = int((test > 0).sum())
+        if validation_non_zero_points < 4:
+            return None, "验证窗口非零样本不足，已跳过标准预测链", None, None
+        future_dates = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
 
         if verbose:
             print(f"\nModel competition starting (mode={mode})...")
@@ -171,19 +186,22 @@ def process_single_spu(
             train_exog,
             test_exog,
             verbose=False,
+            screening=screening,
             log_fn=(lambda message: log_fn(f"SPU {spu} | {message}")) if log_fn is not None else None,
         )
-        if not all_results:
+        valid_results = [result for result in all_results if np.isfinite(result.get("wmape", float("inf")))]
+        if not valid_results:
             fallback_pred_test = np.full(len(test), float(test.mean()) if test.mean() > 0 else float(series_clean.mean()))
             fallback_wmape = float(
                 np.sum(np.abs(test.values - fallback_pred_test)) / np.sum(np.abs(test.values))
-                if np.any(test.values != 0)
-                else 0.0
+                if (test > 0).sum() >= 4 and np.any(test.values != 0)
+                else float("inf")
             )
             winner = {"name": "NaiveMean", "forecast": fallback_pred_test.tolist(), "wmape": fallback_wmape, "params": {}}
             all_results = [winner]
         else:
-            winner = min(all_results, key=lambda x: x["wmape"])
+            all_results = valid_results
+            winner = min(valid_results, key=lambda x: x["wmape"])
 
         future_exog = None
         if has_exog and exog_series is not None:
@@ -204,10 +222,9 @@ def process_single_spu(
                 print("   Warning: forecast volatility is unusually low; fallback smoothing will be applied.")
 
         fallback_value = float(series_clean.iloc[-8:].mean())
-        final_preds = safe_predictions(final_preds, fallback_value, winner["name"])
+        final_preds = safe_predictions(final_preds, fallback_value, winner["name"], history_series=series_clean)
 
         total_time = time.time() - t0
-        future_dates = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
         profile = profiler.update_with_results(profile, train, test, all_results, winner, final_preds, total_time)
 
         if verbose:

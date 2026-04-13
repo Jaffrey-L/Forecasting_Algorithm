@@ -54,24 +54,18 @@ app.mount("/static", StaticFiles(directory=static_root), name="static")
 
 
 class SelectionResolveRequest(BaseModel):
-    selection_type: str = Field(pattern="^(all|manual|sql)$")
-    manual_spus: str = ""
-    sql_query: str = ""
+    selection_type: str = Field(default="all", pattern="^all$")
 
 
 class JobCreateRequest(BaseModel):
     mode: str = "smart"
-    selection_type: str = Field(pattern="^(all|manual|sql)$")
-    manual_spus: str = ""
-    sql_query: str = ""
+    selection_type: str = Field(default="all", pattern="^all$")
     config_id: Optional[str] = None
 
 
 class LegacyStartRequest(BaseModel):
     mode: str = "smart"
-    selection_type: str = "all"
-    manual_spus: str = ""
-    sql_query: str = ""
+    selection_type: str = Field(default="all", pattern="^all$")
     config_id: Optional[str] = None
 
 
@@ -79,9 +73,7 @@ class ConfigCreateRequest(BaseModel):
     name: str
     purpose: str = ""
     mode: str = "smart"
-    selection_type: str = Field(pattern="^(all|manual|sql)$")
-    manual_spus: str = ""
-    sql_query: str = ""
+    selection_type: str = Field(default="all", pattern="^all$")
     is_active: bool = True
 
 
@@ -103,10 +95,7 @@ class WeeklyScheduleRequest(BaseModel):
 
 
 def _selection_payload(request: Any):
-    return {
-        "manual_spus": getattr(request, "manual_spus", ""),
-        "sql_query": getattr(request, "sql_query", ""),
-    }
+    return {}
 
 
 def _default_weekly_schedule() -> dict[str, Any]:
@@ -436,11 +425,13 @@ async def compatibility_start_analysis(request: LegacyStartRequest):
                 trigger_source="manual",
             )
         return {
-            "message": "Analysis started.",
-            "status": "running",
+            "message": "Analysis queued.",
+            "status": run.get("status", "queued"),
             "mode": run["mode"],
             "run_id": run["id"],
             "trigger_source": run.get("trigger_source"),
+            "progress": run.get("progress"),
+            "current_spu": run.get("current_spu"),
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

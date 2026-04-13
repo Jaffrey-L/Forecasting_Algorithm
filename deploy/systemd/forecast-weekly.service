@@ -1,12 +1,20 @@
 [Unit]
 Description=Weekly forecast execution job
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/forecasting_app/current
 EnvironmentFile=/etc/forecasting_app.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/forecasting_app/venv/bin/python scripts/run_forecast_job.py --mode smart --selection-type all --trigger-source schedule
+ExecStart=/usr/bin/flock -n /run/lock/forecast-weekly.lock /opt/forecasting_app/venv/bin/python scripts/run_forecast_job.py --mode smart --selection-type all --trigger-source schedule
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=2h
+TimeoutStopSec=30
+KillMode=control-group
 StandardOutput=append:/var/log/forecast-weekly.log
 StandardError=append:/var/log/forecast-weekly.log

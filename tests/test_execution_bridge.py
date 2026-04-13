@@ -1,4 +1,4 @@
-﻿def test_execution_bridge_reexports_kernel_api(monkeypatch):
+def test_execution_bridge_reexports_kernel_api(monkeypatch):
     import src.forecasting.execution_bridge as bridge
 
     monkeypatch.setattr(bridge.forecast_kernel, "get_data_from_db", lambda db_url: f"bridge:{db_url}")
@@ -19,16 +19,19 @@ def test_runtime_uses_execution_bridge(monkeypatch, tmp_path):
 
     df = pd.DataFrame(
         {
-            "date": list(pd.date_range("2024-01-07", periods=8, freq="W")) * 2
-            + list(pd.date_range("2024-01-07", periods=6, freq="W")),
-            "spu": ["SPU001"] * 8 + ["SPU002"] * 8 + ["SPU003"] * 6,
-            "sales": [10, 12, 14, 16, 18, 20, 22, 24] + [10, 12, 14, 16, 18, 0, 22, 24] + [8, 9, 10, 11, 12, 13],
-            "sku": ["SKU001"] * 8 + ["SKU002"] * 8 + ["SKU003"] * 6,
+            "date": list(pd.date_range("2024-01-07", periods=12, freq="W")) * 3,
+            "spu": ["SPU001"] * 12 + ["SPU002"] * 12 + ["SPU003"] * 12,
+            "sales": [10] * 12 + [10] * 8 + [0] * 4 + [0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2],
+            "sku": ["SKU001"] * 36,
         }
     )
     monkeypatch.setattr(runtime_module, "get_data_from_db", lambda _db_url: df)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_WEEKS", 1)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WEEKS", 4)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS", 8)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WINDOW_WEEKS", 12)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MAX_ZERO_RATIO_26W", 0.25)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES", 4.0)
 
     store = PlatformStore(str(tmp_path / "platform_state.db"))
     manager = runtime_module.ForecastRuntimeManager(store=store, db_url="sqlite:///demo")
@@ -83,17 +86,17 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
 
     df = pd.DataFrame(
         {
-            "date": pd.date_range("2024-01-07", periods=8, freq="W"),
-            "spu": ["SPU001"] * 8,
-            "sales": [10, 12, 14, 16, 18, 20, 22, 24],
-            "sku": ["SKU001"] * 8,
+            "date": pd.date_range("2024-01-07", periods=12, freq="W"),
+            "spu": ["SPU001"] * 12,
+            "sales": [10] * 12,
+            "sku": ["SKU001"] * 12,
         }
     )
 
     def stub_process_single_spu(spu, df_spu, **kwargs):
         log_fn = kwargs.get("log_fn")
         if log_fn is not None:
-            log_fn("SPU001 model competition starting, train=6 weeks, test=2 weeks.")
+            log_fn("SPU001 model competition starting, train=8 weeks, test=4 weeks.")
             log_fn("SPU001 | 运行 Prophet...")
             log_fn("SPU001 | Prophet: WMAPE=12.34%")
         result_df = pd.DataFrame(
@@ -110,6 +113,10 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime_module, "save_to_database", lambda *args, **kwargs: None)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_WEEKS", 1)
     monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WEEKS", 4)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_NON_ZERO_WEEKS", 8)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_RECENT_WINDOW_WEEKS", 12)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MAX_ZERO_RATIO_26W", 0.25)
+    monkeypatch.setattr(runtime_module, "DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES", 4.0)
 
     store = PlatformStore(str(tmp_path / "platform_state.db"))
     manager = runtime_module.ForecastRuntimeManager(store=store, db_url="sqlite:///demo")
@@ -117,8 +124,8 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
         config_id=None,
         trigger_source="manual",
         mode="smart",
-        selection_type="manual",
-        selection_payload={"manual_spus": "SPU001"},
+        selection_type="all",
+        selection_payload={},
         selected_spus=["SPU001"],
     )
     stop_event = runtime_module.threading.Event()
@@ -128,6 +135,6 @@ def test_runtime_captures_model_competition_logs(monkeypatch, tmp_path):
 
     logs = store.get_logs(run["id"], limit=50)
     messages = [row["message"] for row in logs]
-    assert any("[SPU SPU001] SPU001 model competition starting, train=6 weeks, test=2 weeks." in message for message in messages)
+    assert any("[SPU SPU001] SPU001 model competition starting, train=8 weeks, test=4 weeks." in message for message in messages)
     assert any("[SPU SPU001] SPU001 | 运行 Prophet..." in message for message in messages)
     assert any("[SPU SPU001] SPU001 | Prophet: WMAPE=12.34%" in message for message in messages)

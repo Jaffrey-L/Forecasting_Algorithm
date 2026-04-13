@@ -40,14 +40,7 @@
                         <option value="full">Full</option>
                     </select>
                 </label>
-                <div class="segment">
-                    <button class="segment-btn active" data-selection="all">全选</button>
-                    <button class="segment-btn" data-selection="manual">粘贴清单</button>
-                    <button class="segment-btn" data-selection="sql">SQL 输出</button>
-                </div>
                 <div id="selectionHelp" class="helper-text">系统将自动解析当前可预测的全部 SPU。</div>
-                <textarea id="manualInput" class="hidden" placeholder="一行一个 SPU，或使用逗号/空格分隔"></textarea>
-                <textarea id="sqlInput" class="hidden" placeholder="输入仅返回单列 spu 的 SELECT 语句（否则报错）"></textarea>
                 <div class="actions">
                     <button id="resolveSelectionBtn" class="btn btn-secondary">预览 SPU</button>
                     <button id="startJobBtn" class="btn btn-primary">启动任务</button>
