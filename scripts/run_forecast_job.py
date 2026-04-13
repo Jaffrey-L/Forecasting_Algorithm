@@ -41,8 +41,17 @@ def process_lock(lock_path: str):
         yield
         return
 
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    lock_file = open(lock_path, "a+", encoding="utf-8")
+    lock_dir = os.path.dirname(lock_path)
+    try:
+        if lock_dir:
+            os.makedirs(lock_dir, exist_ok=True)
+        lock_file = open(lock_path, "a+", encoding="utf-8")
+    except OSError as exc:
+        # The service already has an outer flock guard; do not fail job startup
+        # because an optional in-process lock path is not writable.
+        print(f"WARN=lock disabled PATH={lock_path} REASON={exc}", flush=True)
+        yield
+        return
     try:
         if os.name == "posix":
             import fcntl
@@ -94,7 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds.")
     parser.add_argument(
         "--lock-file",
-        default="/tmp/forecast-weekly.lock" if os.name == "posix" else "",
+        default=os.path.join(PROJECT_ROOT, "data", "locks", "forecast-weekly.lock")
+        if os.name == "posix"
+        else "",
         help="Process lock file path to avoid concurrent scheduler jobs.",
     )
     return parser
