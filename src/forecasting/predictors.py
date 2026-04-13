@@ -414,6 +414,59 @@ def run_zero_aware_naive(train, test, train_exog=None, test_exog=None, verbose=F
         return None
 
 
+def _croston_sba_forecast(train_series, n_steps, alpha=0.15):
+    values = np.asarray(train_series, dtype=float)
+    values = np.maximum(values, 0.0)
+    if values.size == 0:
+        return np.zeros(n_steps)
+
+    non_zero_idx = np.where(values > 0)[0]
+    if non_zero_idx.size == 0:
+        return np.zeros(n_steps)
+
+    first_idx = int(non_zero_idx[0])
+    z = float(values[first_idx])
+    p = 1.0
+    interval = 1
+
+    for x in values[first_idx + 1 :]:
+        if x > 0:
+            z = z + alpha * (float(x) - z)
+            p = p + alpha * (interval - p)
+            interval = 1
+        else:
+            interval += 1
+
+    demand_rate = z / p if p > 0 else 0.0
+    sba_rate = max((1.0 - alpha / 2.0) * demand_rate, 0.0)
+    return np.full(n_steps, sba_rate, dtype=float)
+
+
+def run_croston_sba(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    try:
+        clean = _series_to_float_series(train)
+        if clean.empty:
+            return None
+        regime = _infer_model_regime(clean, screening)
+        forecast = _croston_sba_forecast(clean.values, len(test), alpha=0.15)
+        if regime["zero_heavy"]:
+            cap = max(regime["recent_mean"] * 1.2, 1.0)
+            forecast = np.minimum(forecast, cap)
+        forecast = np.maximum(forecast, 0)
+        wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        return {
+            "name": "CrostonSBA",
+            "wmape": wmape,
+            "preds": forecast,
+            "model": None,
+            "params": {"alpha": 0.15, "variant": "SBA"},
+        }
+    except Exception as e:
+        if verbose:
+            print(f"CrostonSBA 澶辫触: {e}")
+        return None
+
+
 def run_all_models(
     train,
     test,
@@ -529,6 +582,11 @@ def run_all_models(
     if zero_naive_result:
         models.append(zero_naive_result)
         _emit_model_log(log_fn, f"ZeroAwareNaive: WMAPE={zero_naive_result['wmape']:.2%}")
+
+    croston_result = run_croston_sba(train, test, train_exog, test_exog, verbose, screening=screening)
+    if croston_result:
+        models.append(croston_result)
+        _emit_model_log(log_fn, f"CrostonSBA: WMAPE={croston_result['wmape']:.2%}")
 
     seasonal_naive_result = run_seasonal_naive(train, test, train_exog, test_exog, verbose, screening=screening)
     if seasonal_naive_result:
