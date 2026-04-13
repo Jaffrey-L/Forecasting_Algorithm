@@ -168,6 +168,18 @@ def _standard_model_score(model: dict, test_series: pd.Series) -> float:
     return wmape + 0.12 * over_bias + 0.08 * pred_jump + 0.06 * zero_mismatch
 
 
+def _best_ensemble_candidate(valid_results: list[dict]) -> dict | None:
+    ensemble_candidates = [
+        candidate
+        for candidate in valid_results
+        if str(candidate.get("name", "")).startswith("Ensemble")
+        and np.isfinite(float(candidate.get("wmape", float("inf"))))
+    ]
+    if not ensemble_candidates:
+        return None
+    return min(ensemble_candidates, key=lambda item: float(item.get("wmape", float("inf"))))
+
+
 def _apply_low_signal_post_rules(preds: np.ndarray, history_series: pd.Series, screening: dict) -> np.ndarray:
     adjusted = np.asarray(preds, dtype=float).flatten().copy()
     if adjusted.size == 0:
@@ -340,6 +352,30 @@ def process_single_spu(
                         ]
                     )
                     log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+                # Hybrid bridge: when signal is not extremely sparse, allow
+                # stable ensemble to win if its error is close to conservative winner.
+                ensemble_candidate = _best_ensemble_candidate(valid_results)
+                if ensemble_candidate is not None:
+                    winner_wmape = float(winner.get("wmape", float("inf")))
+                    ensemble_wmape = float(ensemble_candidate.get("wmape", float("inf")))
+                    hybrid_ready = (
+                        validation_non_zero_points >= 8
+                        and float(screening.get("zero_ratio", 1.0)) <= 0.45
+                        and float(screening.get("recent_mean", 0.0)) >= 1.0
+                    )
+                    if (
+                        hybrid_ready
+                        and np.isfinite(winner_wmape)
+                        and np.isfinite(ensemble_wmape)
+                        and ensemble_wmape <= winner_wmape + 0.02
+                    ):
+                        winner = ensemble_candidate
+                        if log_fn is not None:
+                            log_fn(
+                                f"SPU {spu} hybrid override enabled: "
+                                f"choose {winner['name']} ({ensemble_wmape:.4f}) "
+                                f"over conservative winner ({winner_wmape:.4f})."
+                            )
             else:
                 wmape_ranked = sorted(valid_results, key=lambda item: item.get("wmape", float("inf")))
                 winner = wmape_ranked[0]
