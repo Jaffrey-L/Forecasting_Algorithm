@@ -108,6 +108,65 @@ def get_data_from_db(db_url):
         print("数据库连接已关闭")
 
 
+def _conservative_model_score(model: dict, test_series: pd.Series) -> float:
+    preds = np.asarray(model.get("preds", []), dtype=float).flatten()
+    actual = np.asarray(test_series.values, dtype=float).flatten()
+    n = min(len(preds), len(actual))
+    if n == 0:
+        return float("inf")
+    preds = np.maximum(preds[:n], 0.0)
+    actual = actual[:n]
+
+    wmape = float(model.get("wmape", float("inf")))
+    if not np.isfinite(wmape):
+        wmape = 9.999
+
+    actual_zero_ratio = float(np.mean(actual == 0.0))
+    pred_zero_ratio = float(np.mean(preds <= 1e-6))
+    zero_mismatch = abs(pred_zero_ratio - actual_zero_ratio)
+
+    pred_mean = float(np.mean(preds)) if n > 0 else 0.0
+    actual_mean = float(np.mean(actual)) if n > 0 else 0.0
+    over_bias = max(pred_mean - actual_mean, 0.0) / max(actual_mean, 1.0)
+
+    pred_diff = np.diff(preds) if n > 1 else np.array([0.0])
+    pred_jump = float(np.mean(np.abs(pred_diff))) / max(actual_mean, 1.0)
+
+    # Composite score: accuracy first, then consistency and stability.
+    return wmape + 0.35 * zero_mismatch + 0.15 * over_bias + 0.10 * pred_jump
+
+
+def _apply_low_signal_post_rules(preds: np.ndarray, history_series: pd.Series, screening: dict) -> np.ndarray:
+    adjusted = np.asarray(preds, dtype=float).flatten().copy()
+    if adjusted.size == 0:
+        return adjusted
+
+    hist = pd.Series(history_series).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if hist.empty:
+        return np.maximum(adjusted, 0.0)
+
+    recent = hist.tail(min(12, len(hist)))
+    recent_non_zero = recent[recent > 0]
+    anchor = float(recent_non_zero.median()) if not recent_non_zero.empty else float(recent.mean())
+    anchor = max(anchor, 0.0)
+    recent_std = float(recent.std(ddof=0)) if len(recent) > 1 else 0.0
+    recent_peak = float(recent.max()) if len(recent) > 0 else anchor
+
+    cap = max(anchor * 2.2, recent_peak * 1.5, anchor + recent_std * 2.5, 1.0)
+    adjusted = np.minimum(np.maximum(adjusted, 0.0), cap)
+
+    max_step = max(anchor * 0.6, recent_std * 2.0, 1.0)
+    for idx in range(1, len(adjusted)):
+        lo = max(adjusted[idx - 1] - max_step, 0.0)
+        hi = adjusted[idx - 1] + max_step
+        adjusted[idx] = float(np.clip(adjusted[idx], lo, hi))
+
+    if int(screening.get("recent_zero_weeks", 0)) >= 1 and anchor < 30:
+        adjusted[0] = min(adjusted[0], anchor * 0.8)
+
+    return np.maximum(adjusted, 0.0)
+
+
 def process_single_spu(
     spu,
     df_spu,
@@ -223,13 +282,34 @@ def process_single_spu(
             fallback_wmape = float(
                 np.sum(np.abs(test.values - fallback_pred_test)) / np.sum(np.abs(test.values))
                 if (test > 0).sum() >= 4 and np.any(test.values != 0)
-                else float("inf")
+                else 9.999
             )
             winner = {"name": "NaiveMean", "forecast": fallback_pred_test.tolist(), "wmape": fallback_wmape, "params": {}}
             all_results = [winner]
         else:
             all_results = valid_results
-            winner = min(valid_results, key=lambda x: x["wmape"])
+            if model_policy == "conservative":
+                ranked = sorted(
+                    [
+                        (
+                            _conservative_model_score(candidate, test),
+                            candidate,
+                        )
+                        for candidate in valid_results
+                    ],
+                    key=lambda item: item[0],
+                )
+                winner = ranked[0][1]
+                if log_fn is not None:
+                    score_text = ", ".join(
+                        [
+                            f"{item[1]['name']}={item[0]:.4f}"
+                            for item in ranked[:4]
+                        ]
+                    )
+                    log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+            else:
+                winner = min(valid_results, key=lambda x: x["wmape"])
 
         future_exog = None
         if has_exog and exog_series is not None:
@@ -251,6 +331,8 @@ def process_single_spu(
 
         fallback_value = float(series_clean.iloc[-8:].mean())
         final_preds = safe_predictions(final_preds, fallback_value, winner["name"], history_series=series_clean)
+        if model_policy == "conservative":
+            final_preds = _apply_low_signal_post_rules(final_preds, series_clean, screening)
 
         total_time = time.time() - t0
         profile = profiler.update_with_results(profile, train, test, all_results, winner, final_preds, total_time)
