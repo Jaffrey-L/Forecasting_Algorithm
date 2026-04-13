@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -27,6 +28,7 @@ db_url = os.getenv(
 
 store = PlatformStore(platform_db)
 manager = ForecastRuntimeManager(store=store, db_url=db_url)
+HISTORY_WINDOW_HOURS = int(os.getenv("FORECAST_HISTORY_WINDOW_HOURS", "24"))
 
 
 @asynccontextmanager
@@ -149,7 +151,7 @@ def _write_weekly_schedule(payload: dict[str, Any]) -> dict[str, Any]:
 def _preferred_run(run_id: Optional[str] = None):
     if run_id:
         return store.get_run(run_id)
-    runs = store.list_runs(limit=20)
+    runs = [run for run in store.list_runs(limit=200) if not _is_history_run(run)]
     for preferred_status in ("running", "queued", "stopping"):
         for run in runs:
             if run["status"] == preferred_status:
@@ -162,6 +164,44 @@ def _preferred_active_run(run_id: Optional[str] = None):
     if run and run.get("status") in ACTIVE_RUN_STATUSES:
         return run
     return None
+
+
+def _parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    # Normalize sqlite/ISO variants:
+    # - "2026-04-13T03:21:52Z"
+    # - "2026-04-13 03:21:50"
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    if " " in value and "T" not in value:
+        value = value.replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _run_reference_time(run: dict[str, Any]) -> Optional[datetime]:
+    for key in ("updated_at", "finished_at", "started_at", "created_at"):
+        parsed = _parse_timestamp(run.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _is_history_run(run: dict[str, Any]) -> bool:
+    reference = _run_reference_time(run)
+    if reference is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=HISTORY_WINDOW_HOURS)
+    return reference < cutoff
 
 
 def _legacy_status_payload(run: Optional[dict[str, Any]]):
@@ -292,8 +332,18 @@ async def create_forecast_job(request: JobCreateRequest):
 
 
 @app.get("/api/forecast-jobs")
-async def list_forecast_jobs(limit: int = 20):
-    return store.list_runs(limit=limit)
+async def list_forecast_jobs(limit: int = 20, include_history: bool = True):
+    runs = store.list_runs(limit=max(limit, 1))
+    if include_history:
+        return runs[:limit]
+    return [run for run in runs if not _is_history_run(run)][:limit]
+
+
+@app.get("/api/forecast-jobs/history")
+async def list_forecast_job_history(limit: int = 50):
+    runs = store.list_runs(limit=max(limit * 5, 100))
+    history_runs = [run for run in runs if _is_history_run(run)]
+    return history_runs[:limit]
 
 
 @app.get("/api/forecast-jobs/{run_id}")
