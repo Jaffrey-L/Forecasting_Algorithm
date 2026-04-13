@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-url", default=DEFAULT_DB_URL, help="Source database URL.")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds.")
     parser.add_argument(
+        "--active-run-timeout-hours",
+        type=float,
+        default=6.0,
+        help="Treat active runs older than this timeout as stale and auto-close them.",
+    )
+    parser.add_argument(
         "--lock-file",
         default=os.path.join(PROJECT_ROOT, "data", "locks", "forecast-weekly.lock")
         if os.name == "posix"
@@ -109,6 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process lock file path to avoid concurrent scheduler jobs.",
     )
     return parser
+
+
+def _parse_iso_utc(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def main() -> int:
@@ -125,8 +141,26 @@ def main() -> int:
                     None,
                 )
             if active_run and active_run.get("status") in ACTIVE_STATUSES:
-                print(f"SKIP=active run exists RUN_ID={active_run['id']} STATUS={active_run['status']}", flush=True)
-                return 0
+                run_updated_at = _parse_iso_utc(active_run.get("updated_at") or active_run.get("started_at"))
+                stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=args.active_run_timeout_hours)
+                if run_updated_at is not None and run_updated_at < stale_cutoff:
+                    store.update_run(
+                        active_run["id"],
+                        status="failed",
+                        finished_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                        error_message=(
+                            f"Auto-closed stale active run before new trigger; "
+                            f"last_update={active_run.get('updated_at') or active_run.get('started_at')}"
+                        ),
+                    )
+                    print(
+                        f"STALE_RUN_CLOSED RUN_ID={active_run['id']} STATUS={active_run['status']} "
+                        f"LAST_UPDATE={active_run.get('updated_at') or active_run.get('started_at')}",
+                        flush=True,
+                    )
+                else:
+                    print(f"SKIP=active run exists RUN_ID={active_run['id']} STATUS={active_run['status']}", flush=True)
+                    return 0
 
             if args.config_id:
                 run = manager.run_from_config(args.config_id, trigger_source=args.trigger_source)
