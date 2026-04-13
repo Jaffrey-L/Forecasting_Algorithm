@@ -158,6 +158,38 @@ class ForecastRuntimeManager:
     def _append_log(self, run_id: str, level: str, message: str) -> None:
         self.store.add_log(run_id, level, message)
 
+    def _resolve_selection_with_heartbeat(
+        self,
+        run_id: str,
+        selection_type: str,
+        selection_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        error: Dict[str, Exception] = {}
+        done = threading.Event()
+        started = time.time()
+
+        def _worker() -> None:
+            try:
+                result["resolved"] = self.resolve_selection(selection_type, selection_payload)
+            except Exception as exc:  # pragma: no cover
+                error["exc"] = exc
+            finally:
+                done.set()
+
+        self.store.update_run(run_id, current_spu="Resolving selection scope")
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        while not done.wait(timeout=15):
+            elapsed = int(time.time() - started)
+            self._append_log(run_id, "info", f"Selection scope resolving ({elapsed}s elapsed).")
+
+        worker.join(timeout=1)
+        if "exc" in error:
+            raise error["exc"]
+        return result.get("resolved", {})
+
     def _load_source_data_with_heartbeat(self, run_id: str) -> pd.DataFrame:
         result: Dict[str, Any] = {}
         error: Dict[str, Exception] = {}
@@ -270,7 +302,11 @@ class ForecastRuntimeManager:
                 "info",
                 f"Resolving selection scope for {run['selection_type']} mode.",
             )
-            resolved = self.resolve_selection(run["selection_type"], run.get("selection_payload", {}))
+            resolved = self._resolve_selection_with_heartbeat(
+                run_id,
+                run["selection_type"],
+                run.get("selection_payload", {}),
+            )
             self.store.update_run(
                 run_id,
                 selected_spus_json=json.dumps(resolved["selected_spus"], ensure_ascii=False),
