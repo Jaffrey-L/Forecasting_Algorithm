@@ -180,6 +180,22 @@ def _best_ensemble_candidate(valid_results: list[dict]) -> dict | None:
     return min(ensemble_candidates, key=lambda item: float(item.get("wmape", float("inf"))))
 
 
+def _conservative_shortlist(valid_results: list[dict], wmape_margin: float = 0.015) -> list[dict]:
+    finite_candidates = [
+        candidate
+        for candidate in valid_results
+        if np.isfinite(float(candidate.get("wmape", float("inf"))))
+    ]
+    if not finite_candidates:
+        return []
+    best_wmape = min(float(candidate.get("wmape", float("inf"))) for candidate in finite_candidates)
+    return [
+        candidate
+        for candidate in finite_candidates
+        if float(candidate.get("wmape", float("inf"))) <= best_wmape + wmape_margin
+    ]
+
+
 def _apply_low_signal_post_rules(preds: np.ndarray, history_series: pd.Series, screening: dict) -> np.ndarray:
     adjusted = np.asarray(preds, dtype=float).flatten().copy()
     if adjusted.size == 0:
@@ -333,13 +349,16 @@ def process_single_spu(
         else:
             all_results = valid_results
             if model_policy == "conservative":
+                wmape_best_candidate = min(valid_results, key=lambda item: float(item.get("wmape", float("inf"))))
+                shortlist = _conservative_shortlist(valid_results, wmape_margin=0.015)
+                candidates_for_rank = shortlist if shortlist else valid_results
                 ranked = sorted(
                     [
                         (
                             _conservative_model_score(candidate, test),
                             candidate,
                         )
-                        for candidate in valid_results
+                        for candidate in candidates_for_rank
                     ],
                     key=lambda item: item[0],
                 )
@@ -352,6 +371,16 @@ def process_single_spu(
                         ]
                     )
                     log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+                winner_wmape = float(winner.get("wmape", float("inf")))
+                wmape_best_value = float(wmape_best_candidate.get("wmape", float("inf")))
+                if np.isfinite(winner_wmape) and np.isfinite(wmape_best_value) and winner_wmape > wmape_best_value + 0.015:
+                    winner = wmape_best_candidate
+                    if log_fn is not None:
+                        log_fn(
+                            f"SPU {spu} conservative wmape guardrail activated: "
+                            f"use {winner['name']} ({wmape_best_value:.4f}) "
+                            f"instead of higher-error candidate ({winner_wmape:.4f})."
+                        )
                 # Hybrid bridge: when signal is not extremely sparse, allow
                 # stable ensemble to win if its error is close to conservative winner.
                 ensemble_candidate = _best_ensemble_candidate(valid_results)
