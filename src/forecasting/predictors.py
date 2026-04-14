@@ -530,9 +530,14 @@ def run_all_models(
     model_policy='standard',
 ):
     """
-    运行所有预测模型，并记录每个模型的效果。
+    运行所有预测模型，并输出分层结果：
+    1) base: 通用算法
+    2) robust: 低信号/间歇性需求稳健算法
+    3) ensemble: 综合算法（在单模型结果基础上构建）
     """
     models = []
+    base_models = []
+    robust_models = []
     conservative = str(model_policy).lower() == "conservative"
     enabled_base_models = []
 
@@ -551,7 +556,9 @@ def run_all_models(
             _emit_model_log(log_fn, "运行 Prophet...")
             prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
             if prophet_result:
+                prophet_result["stage"] = "base"
                 models.append(prophet_result)
+                base_models.append(prophet_result)
                 _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
             else:
                 _emit_model_log(log_fn, "Prophet: 失败")
@@ -563,7 +570,9 @@ def run_all_models(
         _emit_model_log(log_fn, "运行 XGBoost...")
         xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose, screening=screening)
         if xgboost_result:
+            xgboost_result["stage"] = "base"
             models.append(xgboost_result)
+            base_models.append(xgboost_result)
             _emit_model_log(log_fn, f"XGBoost: WMAPE={xgboost_result['wmape']:.2%}")
         else:
             _emit_model_log(log_fn, "XGBoost: 失败")
@@ -575,7 +584,9 @@ def run_all_models(
         _emit_model_log(log_fn, "运行 LightGBM...")
         lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose, screening=screening)
         if lightgbm_result:
+            lightgbm_result["stage"] = "base"
             models.append(lightgbm_result)
+            base_models.append(lightgbm_result)
             _emit_model_log(log_fn, f"LightGBM: WMAPE={lightgbm_result['wmape']:.2%}")
         else:
             _emit_model_log(log_fn, "LightGBM: 失败")
@@ -584,45 +595,63 @@ def run_all_models(
     _emit_model_log(log_fn, "运行 AutoARIMA...")
     autoarima_result = run_auto_arima(train, test, train_exog, test_exog, verbose, screening=screening)
     if autoarima_result:
+        autoarima_result["stage"] = "base"
         models.append(autoarima_result)
+        base_models.append(autoarima_result)
         _emit_model_log(log_fn, f"AutoARIMA: WMAPE={autoarima_result['wmape']:.2%}")
     else:
         _emit_model_log(log_fn, "AutoARIMA: 失败")
 
     models = [m for m in models if m is not None]
-    base_results = {m['name']: m for m in models}
+    base_models = [m for m in base_models if m is not None]
 
-    _emit_model_log(log_fn, f"\n基础模型运行完成: {len(models)}/{len(enabled_base_models)} 个成功")
+    _emit_model_log(log_fn, f"\n基础模型运行完成: {len(base_models)}/{len(enabled_base_models)} 个成功")
 
-    if len(models) >= 2:
+    if len(base_models) >= 2:
         _emit_model_log(log_fn, "运行融合算法...")
 
-        avg_forecast = np.mean([m['preds'] for m in models], axis=0)
+        avg_components = [m["name"] for m in base_models]
+        avg_forecast = np.mean([m["preds"] for m in base_models], axis=0)
         avg_wmape = calculate_wmape(test, avg_forecast, min_non_zero_points=4)
-        models.append({
-            'name': 'Ensemble-Avg',
-            'preds': avg_forecast,
-            'wmape': avg_wmape,
-            'model': None
-        })
+        models.append(
+            {
+                "name": "Ensemble-Avg",
+                "stage": "ensemble",
+                "preds": avg_forecast,
+                "wmape": avg_wmape,
+                "model": None,
+                "component_models": avg_components,
+                "component_weights": {name: 1.0 / len(avg_components) for name in avg_components},
+            }
+        )
         _emit_model_log(log_fn, f"Ensemble-Avg: WMAPE={avg_wmape:.2%}")
 
-        weights = [1 / m['wmape'] if np.isfinite(m['wmape']) and m['wmape'] > 0 else 0 for m in models if 'preds' in m]
-        if sum(weights) > 0:
-            weights = [w / sum(weights) for w in weights]
-            base_models_for_weighted = [m for m in models if m['name'] not in ['Ensemble-Avg', 'Ensemble-Weighted']]
+        inv_weights = [1.0 / m["wmape"] if np.isfinite(m["wmape"]) and m["wmape"] > 0 else 0.0 for m in base_models]
+        weight_sum = float(sum(inv_weights))
+        if weight_sum > 0:
+            weights = [w / weight_sum for w in inv_weights]
+            base_models_for_weighted = list(base_models)
             weighted_forecast = np.average(
-                [m['preds'] for m in base_models_for_weighted],
+                [m["preds"] for m in base_models_for_weighted],
                 axis=0,
-                weights=weights[:len(base_models_for_weighted)],
+                weights=weights,
             )
             weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
-            models.append({
-                'name': 'Ensemble-Weighted',
-                'preds': weighted_forecast,
-                'wmape': weighted_wmape,
-                'model': None
-            })
+            component_weights = {
+                base_models_for_weighted[idx]["name"]: float(weights[idx])
+                for idx in range(len(base_models_for_weighted))
+            }
+            models.append(
+                {
+                    "name": "Ensemble-Weighted",
+                    "stage": "ensemble",
+                    "preds": weighted_forecast,
+                    "wmape": weighted_wmape,
+                    "model": None,
+                    "component_models": [m["name"] for m in base_models_for_weighted],
+                    "component_weights": component_weights,
+                }
+            )
             _emit_model_log(log_fn, f"Ensemble-Weighted: WMAPE={weighted_wmape:.2%}")
 
         _emit_model_log(log_fn, "融合算法运行完成")
@@ -631,23 +660,35 @@ def run_all_models(
 
     zero_naive_result = run_zero_aware_naive(train, test, train_exog, test_exog, verbose, screening=screening)
     if zero_naive_result:
+        zero_naive_result["stage"] = "robust"
         models.append(zero_naive_result)
+        robust_models.append(zero_naive_result)
         _emit_model_log(log_fn, f"ZeroAwareNaive: WMAPE={zero_naive_result['wmape']:.2%}")
 
     croston_result = run_croston_sba(train, test, train_exog, test_exog, verbose, screening=screening)
     if croston_result:
+        croston_result["stage"] = "robust"
         models.append(croston_result)
+        robust_models.append(croston_result)
         _emit_model_log(log_fn, f"CrostonSBA: WMAPE={croston_result['wmape']:.2%}")
 
     low_signal_result = run_low_signal_median(train, test, train_exog, test_exog, verbose, screening=screening)
     if low_signal_result:
+        low_signal_result["stage"] = "robust"
         models.append(low_signal_result)
+        robust_models.append(low_signal_result)
         _emit_model_log(log_fn, f"LowSignalMedian: WMAPE={low_signal_result['wmape']:.2%}")
 
     seasonal_naive_result = run_seasonal_naive(train, test, train_exog, test_exog, verbose, screening=screening)
     if seasonal_naive_result:
+        seasonal_naive_result["stage"] = "robust"
         models.append(seasonal_naive_result)
+        robust_models.append(seasonal_naive_result)
         _emit_model_log(log_fn, f"SeasonalNaive: WMAPE={seasonal_naive_result['wmape']:.2%}")
+
+    # Base results are used by future prediction stage; keep atomic models only.
+    atomic_models = [m for m in models if not str(m.get("name", "")).startswith("Ensemble")]
+    base_results = {m["name"]: m for m in atomic_models}
 
     _emit_model_log(log_fn, "=" * 70)
 
@@ -715,73 +756,221 @@ def calculate_sku_accuracy(actual, pred):
     }
 
 
-def predict_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None):
-    if winner['name'] == 'Prophet':
-        if Prophet is None:
-            clean = _series_to_float_series(series)
-            fallback_value = float(clean.tail(8).mean()) if not clean.empty else 0.0
-            return np.maximum(np.full(n_steps, fallback_value), 0.0)
-        df = pd.DataFrame({'ds': series.index, 'y': series.values})
-        if exog_series is not None:
-            # 纭繚澶栫敓鍙橀噺鐨勬椂闂寸储寮曚笌series鐨勬椂闂寸储寮曚竴鑷?            exog_series = exog_series.reindex(series.index)
-            for col in exog_series.columns:
-                df[col] = exog_series[col].values
-        model = Prophet(
-            seasonality_mode='multiplicative',
-            changepoint_prior_scale=0.1,
-            seasonality_prior_scale=10.0,
-            changepoint_range=0.8
-        )
-        if exog_series is not None:
-            for col in exog_series.columns:
-                model.add_regressor(col)
-        model.fit(df)
-        future = model.make_future_dataframe(periods=n_steps, freq='W')
-        if future_exog is not None:
-            for col in future_exog.columns:
-                if exog_series is not None:
-                    hist_exog = exog_series[col].values
-                    fut_exog = future_exog[col].values
-                    all_exog = np.concatenate([hist_exog, fut_exog])
-                    if len(all_exog) == len(future):
-                        future[col] = all_exog
-                    else:
-                        future[col] = np.concatenate([np.full(len(series), np.nan), fut_exog])
-                else:
-                    future[col] = np.concatenate([np.full(len(series), np.nan), future_exog[col].values])
-        forecast = model.predict(future)
-        return np.maximum(forecast['yhat'].values[-n_steps:], 0)
-    elif winner['name'] in ['XGBoost', 'LightGBM']:
-        fe = FeatureEngineer()
-        X, y = fe.make_features(pd.DataFrame(series), exog_series)
-        model = winner['model']
-        model.fit(X, y)
-        future_dates = pd.date_range(series.index[-1], periods=n_steps + 1, freq='W')[1:]
-        future_df = pd.DataFrame(index=future_dates, columns=['y'])
-        future_df['y'] = 0
-        if future_exog is not None:
-            X_future, _ = fe.make_features_for_prediction(future_df, future_exog)
-        else:
-            X_future, _ = fe.make_features_for_prediction(future_df)
-        preds = model.predict(X_future)
-        return np.maximum(preds, 0)
-    elif winner['name'] == 'SeasonalNaive':
+def _predict_prophet_future(series, n_steps, exog_series=None, future_exog=None):
+    if Prophet is None:
         clean = _series_to_float_series(series)
-        if clean.empty:
-            return np.zeros(n_steps)
-        if len(clean) >= 52:
-            season_length = 52
-        elif len(clean) >= 26:
-            season_length = 13
-        else:
-            season_length = max(4, min(8, len(clean)))
-        tail = clean.iloc[-season_length:].to_numpy() if len(clean) >= season_length else np.full(n_steps, float(clean.mean()))
-        preds = np.resize(tail, n_steps)
-        return np.maximum(preds, 0)
-    elif winner['name'] == 'ZeroAwareNaive':
-        return _build_zero_aware_forecast(series, n_steps, None)
+        fallback_value = float(clean.tail(8).mean()) if not clean.empty else 0.0
+        return np.maximum(np.full(n_steps, fallback_value), 0.0)
+    df = pd.DataFrame({"ds": series.index, "y": series.values})
+    if exog_series is not None and not exog_series.empty:
+        aligned = exog_series.reindex(series.index)
+        for col in aligned.columns:
+            df[col] = aligned[col].values
+    model = Prophet(
+        seasonality_mode="multiplicative",
+        changepoint_prior_scale=0.1,
+        seasonality_prior_scale=10.0,
+        changepoint_range=0.8,
+    )
+    if exog_series is not None and not exog_series.empty:
+        for col in exog_series.columns:
+            model.add_regressor(col)
+    model.fit(df)
+    future = model.make_future_dataframe(periods=n_steps, freq="W")
+    if future_exog is not None and not future_exog.empty:
+        for col in future_exog.columns:
+            if exog_series is not None and not exog_series.empty and col in exog_series.columns:
+                hist_exog = exog_series[col].values
+                fut_exog = future_exog[col].values
+                all_exog = np.concatenate([hist_exog, fut_exog])
+                if len(all_exog) == len(future):
+                    future[col] = all_exog
+                else:
+                    future[col] = np.concatenate([np.full(len(series), np.nan), fut_exog])
+            else:
+                future[col] = np.concatenate([np.full(len(series), np.nan), future_exog[col].values])
+    forecast = model.predict(future)
+    return np.maximum(forecast["yhat"].values[-n_steps:], 0)
+
+
+def _predict_tree_future(series, n_steps, winner, exog_series=None, future_exog=None):
+    fe = FeatureEngineer()
+    X_hist, y_hist = fe.make_features(pd.DataFrame(series), exog_series)
+    model = winner.get("model")
+    if model is None or X_hist.empty or y_hist.empty:
+        clean = _series_to_float_series(series)
+        fallback = float(clean.tail(8).mean()) if not clean.empty else 0.0
+        return np.maximum(np.full(n_steps, fallback), 0.0)
+    model.fit(X_hist, y_hist)
+    future_dates = pd.date_range(series.index[-1], periods=n_steps + 1, freq="W")[1:]
+    future_df = pd.DataFrame(index=future_dates, columns=["y"])
+    future_df["y"] = 0
+    if future_exog is not None:
+        X_future, _ = fe.make_features_for_prediction(future_df, future_exog)
     else:
-        return np.array([series.mean()] * n_steps)
+        X_future, _ = fe.make_features_for_prediction(future_df)
+    preds = model.predict(X_future)
+    return np.maximum(preds, 0)
+
+
+def _predict_auto_arima_future(series, n_steps, exog_series=None, future_exog=None, screening=None):
+    clean = _series_to_float_series(series)
+    if clean.empty:
+        return np.zeros(n_steps)
+    regime = _infer_model_regime(clean, screening)
+    seasonal = regime["history_weeks"] >= 52 and not regime["zero_heavy"]
+    if regime["history_weeks"] >= 104:
+        m = 52
+    elif regime["history_weeks"] >= 26:
+        m = 13
+    else:
+        m = 1
+    model = pm.auto_arima(
+        clean.values,
+        exogenous=exog_series.values if exog_series is not None else None,
+        seasonal=seasonal and m > 1,
+        m=m,
+        trace=False,
+        error_action="ignore",
+        suppress_warnings=True,
+        stepwise=True,
+    )
+    preds = model.predict(
+        n_periods=n_steps,
+        exogenous=future_exog.values if future_exog is not None else None,
+        return_conf_int=False,
+    )
+    return np.maximum(np.asarray(preds, dtype=float), 0.0)
+
+
+def _predict_seasonal_naive_future(series, n_steps):
+    clean = _series_to_float_series(series)
+    if clean.empty:
+        return np.zeros(n_steps)
+    if len(clean) >= 52:
+        season_length = 52
+    elif len(clean) >= 26:
+        season_length = 13
+    else:
+        season_length = max(4, min(8, len(clean)))
+    tail = clean.iloc[-season_length:].to_numpy() if len(clean) >= season_length else np.full(n_steps, float(clean.mean()))
+    preds = np.resize(tail, n_steps)
+    return np.maximum(preds, 0.0)
+
+
+def _predict_low_signal_median_future(series, n_steps, screening=None):
+    clean = _series_to_float_series(series)
+    if clean.empty:
+        return np.zeros(n_steps)
+    recent = clean.tail(min(16, len(clean)))
+    recent_non_zero = recent[recent > 0]
+    zero_ratio = float((recent == 0).mean()) if len(recent) > 0 else 1.0
+    anchor = float(recent_non_zero.median()) if not recent_non_zero.empty else float(recent.mean())
+    anchor = max(anchor, 0.0)
+    if anchor == 0.0:
+        forecast = np.zeros(n_steps)
+    elif zero_ratio <= 0.25:
+        forecast = np.full(n_steps, anchor, dtype=float)
+    elif zero_ratio <= 0.5:
+        forecast = anchor * np.linspace(1.0, 0.65, n_steps)
+    else:
+        forecast = anchor * np.linspace(1.0, 0.35, n_steps)
+    if screening is not None and float(screening.get("recent_mean", 0.0)) > 0:
+        cap = max(float(screening.get("recent_mean", 0.0)) * 1.4, 1.0)
+        forecast = np.minimum(forecast, cap)
+    return np.maximum(forecast, 0.0)
+
+
+def _predict_ensemble_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None, screening=None):
+    if not isinstance(base_results, dict):
+        base_results = {}
+    component_names = [
+        name
+        for name in winner.get("component_models", [])
+        if not str(name).startswith("Ensemble")
+    ]
+    if not component_names:
+        component_names = [name for name in base_results.keys() if not str(name).startswith("Ensemble")]
+    component_preds = []
+    component_order = []
+    for name in component_names:
+        candidate = base_results.get(name)
+        if candidate is None:
+            continue
+        preds = _predict_single_model_future(
+            series,
+            {**candidate, "name": name},
+            n_steps,
+            exog_series=exog_series,
+            future_exog=future_exog,
+            base_results=base_results,
+            screening=screening,
+        )
+        if preds is None or len(preds) == 0:
+            continue
+        component_preds.append(np.asarray(preds, dtype=float))
+        component_order.append(name)
+    if not component_preds:
+        clean = _series_to_float_series(series)
+        fallback = float(clean.tail(8).mean()) if not clean.empty else 0.0
+        return np.maximum(np.full(n_steps, fallback), 0.0)
+    pred_stack = np.vstack(component_preds)
+    if winner.get("name") == "Ensemble-Weighted":
+        weight_map = winner.get("component_weights", {}) or {}
+        weights = np.asarray([float(weight_map.get(name, 0.0)) for name in component_order], dtype=float)
+        if np.sum(weights) <= 0:
+            weights = np.asarray([1.0 / pred_stack.shape[0]] * pred_stack.shape[0], dtype=float)
+        else:
+            weights = weights / np.sum(weights)
+        merged = np.average(pred_stack, axis=0, weights=weights)
+    else:
+        merged = np.mean(pred_stack, axis=0)
+    return np.maximum(np.asarray(merged, dtype=float), 0.0)
+
+
+def _predict_single_model_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None, screening=None):
+    model_name = str(winner.get("name", ""))
+    if model_name == "Prophet":
+        return _predict_prophet_future(series, n_steps, exog_series=exog_series, future_exog=future_exog)
+    if model_name in ["XGBoost", "LightGBM"]:
+        return _predict_tree_future(series, n_steps, winner, exog_series=exog_series, future_exog=future_exog)
+    if model_name == "AutoARIMA":
+        return _predict_auto_arima_future(series, n_steps, exog_series=exog_series, future_exog=future_exog, screening=screening)
+    if model_name == "SeasonalNaive":
+        return _predict_seasonal_naive_future(series, n_steps)
+    if model_name == "ZeroAwareNaive":
+        return _build_zero_aware_forecast(series, n_steps, screening)
+    if model_name == "CrostonSBA":
+        alpha = float((winner.get("params") or {}).get("alpha", 0.15))
+        clean = _series_to_float_series(series)
+        return _croston_sba_forecast(clean.values, n_steps, alpha=alpha)
+    if model_name == "LowSignalMedian":
+        return _predict_low_signal_median_future(series, n_steps, screening=screening)
+    if model_name in ["Ensemble-Avg", "Ensemble-Weighted"]:
+        return _predict_ensemble_future(
+            series,
+            winner,
+            n_steps,
+            exog_series=exog_series,
+            future_exog=future_exog,
+            base_results=base_results,
+            screening=screening,
+        )
+    clean = _series_to_float_series(series)
+    fallback = float(clean.tail(8).mean()) if not clean.empty else 0.0
+    return np.maximum(np.full(n_steps, fallback), 0.0)
+
+
+def predict_future(series, winner, n_steps, exog_series=None, future_exog=None, base_results=None, screening=None):
+    return _predict_single_model_future(
+        series,
+        winner,
+        n_steps,
+        exog_series=exog_series,
+        future_exog=future_exog,
+        base_results=base_results,
+        screening=screening,
+    )
 
 
 def safe_predictions(preds, fallback_value, model_name, history_series=None):

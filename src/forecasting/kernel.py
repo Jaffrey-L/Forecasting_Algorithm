@@ -228,6 +228,108 @@ def _best_ensemble_candidate(valid_results: list[dict]) -> dict | None:
     return min(ensemble_candidates, key=lambda item: float(item.get("wmape", float("inf"))))
 
 
+def _candidate_stage(candidate: dict) -> str:
+    stage = str(candidate.get("stage", "")).strip().lower()
+    if stage:
+        return stage
+    name = str(candidate.get("name", ""))
+    if name.startswith("Ensemble"):
+        return "ensemble"
+    if name in {"ZeroAwareNaive", "CrostonSBA", "LowSignalMedian", "SeasonalNaive"}:
+        return "robust"
+    return "base"
+
+
+def _select_stage_best(
+    stage_candidates: list[dict],
+    test_series: pd.Series,
+    history_series: pd.Series,
+    model_policy: str,
+    low_signal_window: bool,
+) -> dict:
+    if len(stage_candidates) == 1:
+        return stage_candidates[0]
+    policy = str(model_policy).lower()
+    if policy == "conservative":
+        if low_signal_window:
+            ranked = sorted(
+                [
+                    (
+                        _low_signal_model_score(candidate, test_series, history_series),
+                        _low_signal_model_priority(candidate.get("name", "")),
+                        candidate,
+                    )
+                    for candidate in stage_candidates
+                ],
+                key=lambda item: (item[0], item[1]),
+            )
+            return ranked[0][2]
+        ranked = sorted(
+            [
+                (
+                    _conservative_model_score(candidate, test_series),
+                    candidate,
+                )
+                for candidate in stage_candidates
+            ],
+            key=lambda item: item[0],
+        )
+        return ranked[0][1]
+
+    wmape_ranked = sorted(stage_candidates, key=lambda item: float(item.get("wmape", float("inf"))))
+    if len(wmape_ranked) >= 2:
+        top = float(wmape_ranked[0].get("wmape", float("inf")))
+        second = float(wmape_ranked[1].get("wmape", float("inf")))
+        if np.isfinite(top) and np.isfinite(second) and (second - top) <= 0.025:
+            close = [
+                candidate
+                for candidate in wmape_ranked
+                if float(candidate.get("wmape", 9.999)) - top <= 0.025
+            ]
+            ranked = sorted(
+                [
+                    (
+                        _standard_model_score(candidate, test_series),
+                        candidate,
+                    )
+                    for candidate in close
+                ],
+                key=lambda item: item[0],
+            )
+            return ranked[0][1]
+    return wmape_ranked[0]
+
+
+def _build_two_stage_finalists(
+    valid_results: list[dict],
+    test_series: pd.Series,
+    history_series: pd.Series,
+    model_policy: str,
+    low_signal_window: bool,
+) -> list[dict]:
+    stage_buckets: dict[str, list[dict]] = {}
+    for candidate in valid_results:
+        stage = _candidate_stage(candidate)
+        stage_buckets.setdefault(stage, []).append(candidate)
+    finalists: list[dict] = []
+    for stage_name in ["base", "robust", "ensemble"]:
+        candidates = stage_buckets.get(stage_name, [])
+        if not candidates:
+            continue
+        finalists.append(
+            _select_stage_best(
+                candidates,
+                test_series=test_series,
+                history_series=history_series,
+                model_policy=model_policy,
+                low_signal_window=low_signal_window,
+            )
+        )
+    if not finalists:
+        finalists = list(valid_results)
+    return finalists
+
+
 def _low_signal_model_priority(model_name: str) -> int:
     order = {
         "LowSignalMedian": 0,
@@ -424,8 +526,23 @@ def process_single_spu(
             all_results = [winner]
         else:
             all_results = valid_results
+            finalists = _build_two_stage_finalists(
+                valid_results=valid_results,
+                test_series=test,
+                history_series=series_clean,
+                model_policy=model_policy,
+                low_signal_window=low_signal_window,
+            )
+            if log_fn is not None:
+                finalist_text = ", ".join(
+                    [
+                        f"{item.get('name')}[{_candidate_stage(item)}|wmape={float(item.get('wmape', float('inf'))):.4f}]"
+                        for item in finalists
+                    ]
+                )
+                log_fn(f"SPU {spu} stage finalists: {finalist_text}.")
             if model_policy == "conservative":
-                wmape_best_candidate = min(valid_results, key=lambda item: float(item.get("wmape", float("inf"))))
+                wmape_best_candidate = min(finalists, key=lambda item: float(item.get("wmape", float("inf"))))
                 if low_signal_window:
                     ranked = sorted(
                         [
@@ -434,7 +551,7 @@ def process_single_spu(
                                 _low_signal_model_priority(candidate.get("name", "")),
                                 candidate,
                             )
-                            for candidate in valid_results
+                            for candidate in finalists
                         ],
                         key=lambda item: (item[0], item[1]),
                     )
@@ -443,8 +560,8 @@ def process_single_spu(
                         score_text = ", ".join([f"{item[2]['name']}={item[0]:.4f}" for item in ranked[:4]])
                         log_fn(f"SPU {spu} low-signal model ranking: {score_text}.")
                 else:
-                    shortlist = _conservative_shortlist(valid_results, wmape_margin=0.015)
-                    candidates_for_rank = shortlist if shortlist else valid_results
+                    shortlist = _conservative_shortlist(finalists, wmape_margin=0.015)
+                    candidates_for_rank = shortlist if shortlist else finalists
                     ranked = sorted(
                         [
                             (
@@ -474,7 +591,7 @@ def process_single_spu(
                             )
                 # Hybrid bridge: when signal is not extremely sparse, allow
                 # stable ensemble to win if its error is close to conservative winner.
-                ensemble_candidate = _best_ensemble_candidate(valid_results)
+                ensemble_candidate = _best_ensemble_candidate(finalists)
                 if ensemble_candidate is not None:
                     winner_wmape = float(winner.get("wmape", float("inf")))
                     ensemble_wmape = float(ensemble_candidate.get("wmape", float("inf")))
@@ -503,7 +620,7 @@ def process_single_spu(
                     preferred = ["ZeroAwareNaive", "LowSignalMedian", "CrostonSBA", "SeasonalNaive"]
                     fallback = None
                     for model_name in preferred:
-                        fallback = next((item for item in valid_results if item.get("name") == model_name), None)
+                        fallback = next((item for item in finalists if item.get("name") == model_name), None)
                         if fallback is not None:
                             break
                     if fallback is not None:
@@ -519,7 +636,7 @@ def process_single_spu(
                             f"with proxy error ratio {proxy_wmape:.4f} (validation_non_zero_points=0)."
                         )
             else:
-                wmape_ranked = sorted(valid_results, key=lambda item: item.get("wmape", float("inf")))
+                wmape_ranked = sorted(finalists, key=lambda item: item.get("wmape", float("inf")))
                 winner = wmape_ranked[0]
                 if len(wmape_ranked) >= 2:
                     runner_up = wmape_ranked[1]
@@ -559,7 +676,15 @@ def process_single_spu(
             future_dates_exog = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
             future_exog = build_future_exog_frame(exog_series, future_dates_exog)
 
-        final_preds = predict_future(series_clean, winner, 16, exog_series, future_exog, base_results)
+        final_preds = predict_future(
+            series_clean,
+            winner,
+            16,
+            exog_series,
+            future_exog,
+            base_results,
+            screening=screening,
+        )
 
         hist_cv = series_clean.std() / series_clean.mean() if series_clean.mean() > 0 else 0
         pred_cv = np.std(final_preds) / np.mean(final_preds) if np.mean(final_preds) > 0 else 0
