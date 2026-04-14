@@ -336,6 +336,18 @@ class FeatureEngineer:
             df[f'{col}_delta_1'] = filled - filled.shift(1)
             df[f'{col}_pct_change_1'] = filled.replace(0, np.nan).pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
 
+        # Business interactions: pricing + ads coupling and rough elasticity proxy.
+        if "price" in self.exog_cols and "ad_cost" in self.exog_cols:
+            price = exog_aligned["price"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+            ad_cost = exog_aligned["ad_cost"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+            df["price_ad_interaction"] = price * ad_cost
+            df["ad_cost_per_price"] = ad_cost / np.maximum(price, 1e-6)
+            sales_shift = df["y"].shift(1).replace([np.inf, -np.inf], np.nan)
+            df["price_elasticity_proxy"] = (
+                sales_shift.replace(0, np.nan).pct_change(fill_method=None)
+                / price.replace(0, np.nan).pct_change(fill_method=None)
+            ).replace([np.inf, -np.inf], np.nan)
+
     def _build_frame(self, data_series, exog_df=None, for_prediction=False):
         df = pd.DataFrame(data_series.copy())
         df.columns = ['y']
@@ -425,6 +437,20 @@ class FeatureEngineer:
                 prev_value = feat.get(f'{col}_lag1', current_value)
                 feat[f'{col}_delta_1'] = float(current_value - prev_value)
                 feat[f'{col}_pct_change_1'] = float((current_value - prev_value) / prev_value) if prev_value not in (0, 0.0) else 0.0
+
+            if "price" in self.exog_cols and "ad_cost" in self.exog_cols:
+                price_val = float(feat.get("price", self._exog_means.get("price", 0.0)))
+                ad_val = float(feat.get("ad_cost", self._exog_means.get("ad_cost", 0.0)))
+                feat["price_ad_interaction"] = float(price_val * ad_val)
+                feat["ad_cost_per_price"] = float(ad_val / max(price_val, 1e-6))
+                # Online inference proxy: use last observed sales momentum over price momentum.
+                if len(history_array) >= 2 and history_array[-2] != 0:
+                    sales_change = float((history_array[-1] - history_array[-2]) / history_array[-2])
+                else:
+                    sales_change = 0.0
+                price_prev = float(feat.get("price_lag1", price_val))
+                price_change = float((price_val - price_prev) / price_prev) if price_prev not in (0, 0.0) else 0.0
+                feat["price_elasticity_proxy"] = float(sales_change / price_change) if abs(price_change) > 1e-9 else 0.0
 
         row = pd.DataFrame([feat]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         if self.feature_names:

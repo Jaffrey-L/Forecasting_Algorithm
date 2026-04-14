@@ -330,6 +330,47 @@ def _build_two_stage_finalists(
     return finalists
 
 
+def _stage_gate_bonus(stage: str, screening: dict, low_signal_window: bool, history_weeks: int) -> float:
+    """Lower score is better; negative bonus means preference."""
+    stage_name = str(stage).lower()
+    zero_ratio = float(screening.get("zero_ratio", 0.0))
+    recent_ratio = float(screening.get("recent_to_prior_ratio", 1.0))
+    if low_signal_window or zero_ratio >= 0.55 or recent_ratio <= 0.5:
+        if stage_name == "robust":
+            return -0.05
+        if stage_name == "ensemble":
+            return 0.03
+        return 0.0
+    # Strong-signal regime: encourage ensemble slightly, keep robust neutral.
+    if history_weeks >= 104 and zero_ratio <= 0.35 and recent_ratio >= 0.8:
+        if stage_name == "ensemble":
+            return -0.03
+        if stage_name == "robust":
+            return 0.02
+    return 0.0
+
+
+def _final_candidate_score(
+    candidate: dict,
+    test_series: pd.Series,
+    history_series: pd.Series,
+    screening: dict,
+    model_policy: str,
+    low_signal_window: bool,
+    history_weeks: int,
+) -> float:
+    policy = str(model_policy).lower()
+    if policy == "conservative":
+        base_score = (
+            _low_signal_model_score(candidate, test_series, history_series)
+            if low_signal_window
+            else _conservative_model_score(candidate, test_series)
+        )
+    else:
+        base_score = _standard_model_score(candidate, test_series)
+    return float(base_score + _stage_gate_bonus(_candidate_stage(candidate), screening, low_signal_window, history_weeks))
+
+
 def _low_signal_model_priority(model_name: str) -> int:
     order = {
         "LowSignalMedian": 0,
@@ -481,6 +522,7 @@ def process_single_spu(
         test_exog = exog_series.iloc[-test_len:] if has_exog else None
         validation_non_zero_points = int((test > 0).sum())
         validation_total_sales = float(test.sum())
+        history_weeks = int(len(series_clean))
         low_signal_window = validation_non_zero_points < 6 or validation_total_sales < 120
         model_policy = (
             "conservative"
@@ -543,39 +585,29 @@ def process_single_spu(
                 log_fn(f"SPU {spu} stage finalists: {finalist_text}.")
             if model_policy == "conservative":
                 wmape_best_candidate = min(finalists, key=lambda item: float(item.get("wmape", float("inf"))))
-                if low_signal_window:
-                    ranked = sorted(
-                        [
-                            (
-                                _low_signal_model_score(candidate, test, series_clean),
-                                _low_signal_model_priority(candidate.get("name", "")),
-                                candidate,
-                            )
-                            for candidate in finalists
-                        ],
-                        key=lambda item: (item[0], item[1]),
-                    )
-                    winner = ranked[0][2]
-                    if log_fn is not None:
-                        score_text = ", ".join([f"{item[2]['name']}={item[0]:.4f}" for item in ranked[:4]])
-                        log_fn(f"SPU {spu} low-signal model ranking: {score_text}.")
-                else:
-                    shortlist = _conservative_shortlist(finalists, wmape_margin=0.015)
-                    candidates_for_rank = shortlist if shortlist else finalists
-                    ranked = sorted(
-                        [
-                            (
-                                _conservative_model_score(candidate, test),
-                                candidate,
-                            )
-                            for candidate in candidates_for_rank
-                        ],
-                        key=lambda item: item[0],
-                    )
-                    winner = ranked[0][1]
-                    if log_fn is not None:
-                        score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
-                        log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+                ranked = sorted(
+                    [
+                        (
+                            _final_candidate_score(
+                                candidate=candidate,
+                                test_series=test,
+                                history_series=series_clean,
+                                screening=screening,
+                                model_policy=model_policy,
+                                low_signal_window=low_signal_window,
+                                history_weeks=history_weeks,
+                            ),
+                            _low_signal_model_priority(candidate.get("name", "")),
+                            candidate,
+                        )
+                        for candidate in finalists
+                    ],
+                    key=lambda item: (item[0], item[1]),
+                )
+                winner = ranked[0][2]
+                if log_fn is not None:
+                    score_text = ", ".join([f"{item[2]['name']}={item[0]:.4f}" for item in ranked[:4]])
+                    log_fn(f"SPU {spu} conservative final ranking: {score_text}.")
 
                 winner_wmape = float(winner.get("wmape", float("inf")))
                 wmape_best_value = float(wmape_best_candidate.get("wmape", float("inf")))
@@ -636,40 +668,28 @@ def process_single_spu(
                             f"with proxy error ratio {proxy_wmape:.4f} (validation_non_zero_points=0)."
                         )
             else:
-                wmape_ranked = sorted(finalists, key=lambda item: item.get("wmape", float("inf")))
-                winner = wmape_ranked[0]
-                if len(wmape_ranked) >= 2:
-                    runner_up = wmape_ranked[1]
-                    winner_wmape = float(winner.get("wmape", float("inf")))
-                    runner_wmape = float(runner_up.get("wmape", float("inf")))
-                    if np.isfinite(winner_wmape) and np.isfinite(runner_wmape):
-                        wmape_gap = runner_wmape - winner_wmape
-                        # If top models are close, use a stability-aware tie-breaker.
-                        if wmape_gap <= 0.025:
-                            close_candidates = [
-                                candidate
-                                for candidate in wmape_ranked
-                                if float(candidate.get("wmape", 9.999)) - winner_wmape <= 0.025
-                            ]
-                            ranked = sorted(
-                                [
-                                    (
-                                        _standard_model_score(candidate, test),
-                                        candidate,
-                                    )
-                                    for candidate in close_candidates
-                                ],
-                                key=lambda item: item[0],
-                            )
-                            winner = ranked[0][1]
-                            if log_fn is not None:
-                                score_text = ", ".join(
-                                    [
-                                        f"{item[1]['name']}={item[0]:.4f}"
-                                        for item in ranked[:4]
-                                    ]
-                                )
-                                log_fn(f"SPU {spu} standard close-call ranking: {score_text}.")
+                ranked = sorted(
+                    [
+                        (
+                            _final_candidate_score(
+                                candidate=candidate,
+                                test_series=test,
+                                history_series=series_clean,
+                                screening=screening,
+                                model_policy=model_policy,
+                                low_signal_window=low_signal_window,
+                                history_weeks=history_weeks,
+                            ),
+                            candidate,
+                        )
+                        for candidate in finalists
+                    ],
+                    key=lambda item: item[0],
+                )
+                winner = ranked[0][1]
+                if log_fn is not None:
+                    score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
+                    log_fn(f"SPU {spu} standard final ranking: {score_text}.")
 
         future_exog = None
         if has_exog and exog_series is not None:
