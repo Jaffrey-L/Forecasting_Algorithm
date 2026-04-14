@@ -227,6 +227,107 @@ def _compute_diversity_boost(model_preds, test_series):
     return boosts
 
 
+def _infer_fusion_regime(screening, train, test, conservative):
+    zero_ratio = float((screening or {}).get("zero_ratio", 0.0))
+    recent_ratio = float((screening or {}).get("recent_to_prior_ratio", 1.0))
+    validation_non_zero = int(np.count_nonzero(np.asarray(test, dtype=float) > 0))
+    history_weeks = int(len(train))
+    if conservative or validation_non_zero <= 3 or zero_ratio >= 0.6:
+        return "sparse"
+    if recent_ratio <= 0.45:
+        return "collapse"
+    if history_weeks >= 104 and zero_ratio <= 0.35 and recent_ratio >= 0.85:
+        return "stable"
+    return "mixed"
+
+
+def _fusion_model_gate_factor(model_name, regime):
+    name = str(model_name)
+    robust = {"ZeroAwareNaive", "LowSignalMedian", "CrostonSBA", "SeasonalNaive"}
+    tree = {"XGBoost", "LightGBM"}
+    if regime == "sparse":
+        if name in robust:
+            return 1.25
+        if name in tree or name == "Prophet":
+            return 0.8
+        return 1.0
+    if regime == "collapse":
+        if name in robust:
+            return 1.2
+        if name == "AutoARIMA":
+            return 1.1
+        return 0.95
+    if regime == "stable":
+        if name in tree or name in {"Prophet", "AutoARIMA"}:
+            return 1.15
+        if name in robust:
+            return 0.9
+        return 1.0
+    # mixed
+    if name in robust:
+        return 1.05
+    if name in tree:
+        return 1.05
+    return 1.0
+
+
+def _build_horizon_weight_matrix(component_names, base_weights, n_steps, regime):
+    weights = np.asarray(base_weights, dtype=float).copy()
+    if weights.size == 0:
+        return np.zeros((0, n_steps), dtype=float)
+    if np.sum(weights) <= 0:
+        weights[:] = 1.0 / len(weights)
+    else:
+        weights = weights / np.sum(weights)
+
+    robust = {"ZeroAwareNaive", "LowSignalMedian", "CrostonSBA", "SeasonalNaive"}
+    matrix = np.zeros((len(component_names), n_steps), dtype=float)
+    for h in range(n_steps):
+        # split by horizon: near(0-3), mid(4-7), far(8+)
+        if h <= 3:
+            horizon_phase = "near"
+        elif h <= 7:
+            horizon_phase = "mid"
+        else:
+            horizon_phase = "far"
+
+        row = weights.copy()
+        for i, name in enumerate(component_names):
+            is_robust = name in robust
+            if regime == "sparse":
+                if horizon_phase == "near":
+                    row[i] *= 1.25 if is_robust else 0.85
+                elif horizon_phase == "mid":
+                    row[i] *= 1.15 if is_robust else 0.9
+                else:
+                    row[i] *= 1.05 if is_robust else 0.95
+            elif regime == "stable":
+                if horizon_phase == "near":
+                    row[i] *= 0.95 if is_robust else 1.1
+                elif horizon_phase == "mid":
+                    row[i] *= 0.9 if is_robust else 1.12
+                else:
+                    row[i] *= 0.95 if is_robust else 1.05
+            elif regime == "collapse":
+                if horizon_phase == "near":
+                    row[i] *= 1.2 if is_robust else 0.9
+                elif horizon_phase == "mid":
+                    row[i] *= 1.1 if is_robust else 0.95
+                else:
+                    row[i] *= 1.0
+            else:
+                if horizon_phase == "mid":
+                    row[i] *= 1.05
+
+        s = float(np.sum(row))
+        if s <= 0:
+            row[:] = 1.0 / len(row)
+        else:
+            row = row / s
+        matrix[:, h] = row
+    return matrix
+
+
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     if Prophet is None:
         if verbose:
@@ -795,6 +896,8 @@ def run_all_models(
 
     if len(fusion_pool) >= 2:
         _emit_model_log(log_fn, "运行融合算法...")
+        fusion_regime = _infer_fusion_regime(screening, train, test, conservative)
+        _emit_model_log(log_fn, f"融合场景门控: {fusion_regime}")
 
         avg_components = [m["name"] for m in fusion_pool]
         avg_forecast = np.mean([m["preds"] for m in fusion_pool], axis=0)
@@ -817,6 +920,8 @@ def run_all_models(
 
         effective_scores = [_model_effective_score(m) for m in fusion_pool]
         inv_weights = [1.0 / max(score, 1e-6) if np.isfinite(score) else 0.0 for score in effective_scores]
+        gate_factors = [_fusion_model_gate_factor(m["name"], fusion_regime) for m in fusion_pool]
+        inv_weights = [inv_weights[i] * gate_factors[i] for i in range(len(inv_weights))]
         weight_sum = float(sum(inv_weights))
         if weight_sum > 0:
             weights = [w / weight_sum for w in inv_weights]
@@ -825,15 +930,29 @@ def run_all_models(
             boost_sum = float(sum(weights))
             weights = [w / boost_sum for w in weights] if boost_sum > 0 else [1.0 / len(fusion_pool)] * len(fusion_pool)
             base_models_for_weighted = list(fusion_pool)
-            weighted_forecast = np.average(
-                [m["preds"] for m in base_models_for_weighted],
-                axis=0,
-                weights=weights,
-            )
+            component_names = [m["name"] for m in base_models_for_weighted]
+            pred_matrix = np.vstack([np.asarray(m["preds"], dtype=float) for m in base_models_for_weighted])
+            horizon_weight_matrix = _build_horizon_weight_matrix(component_names, weights, pred_matrix.shape[1], fusion_regime)
+            weighted_forecast = np.sum(pred_matrix * horizon_weight_matrix, axis=0)
             weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
             weighted_quality = _compute_prediction_quality(test, weighted_forecast)
+
+            # Quality guardrail: weighted fusion should not be materially worse than
+            # the best atomic candidate on validation.
+            best_component = min(base_models_for_weighted, key=lambda item: float(item.get("wmape", MAX_WMAPE_CAP)))
+            best_component_wmape = float(best_component.get("wmape", MAX_WMAPE_CAP))
+            if np.isfinite(best_component_wmape) and weighted_wmape > best_component_wmape + 0.015:
+                weighted_forecast = np.asarray(best_component["preds"], dtype=float)
+                weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
+                weighted_quality = _compute_prediction_quality(test, weighted_forecast)
+                _emit_model_log(
+                    log_fn,
+                    f"Ensemble-Weighted guardrail: fallback to {best_component['name']} "
+                    f"(wmape={best_component_wmape:.2%})",
+                )
+
             component_weights = {
-                base_models_for_weighted[idx]["name"]: float(weights[idx])
+                base_models_for_weighted[idx]["name"]: float(np.mean(horizon_weight_matrix[idx, :]))
                 for idx in range(len(base_models_for_weighted))
             }
             models.append(
@@ -847,6 +966,12 @@ def run_all_models(
                     "model": None,
                     "component_models": [m["name"] for m in base_models_for_weighted],
                     "component_weights": component_weights,
+                    "component_base_weights": {
+                        base_models_for_weighted[idx]["name"]: float(weights[idx])
+                        for idx in range(len(base_models_for_weighted))
+                    },
+                    "fusion_regime": fusion_regime,
+                    "fusion_segmentation": "near(1-4)/mid(5-8)/far(9-16)",
                 }
             )
             _emit_model_log(log_fn, f"Ensemble-Weighted: WMAPE={weighted_wmape:.2%}")
@@ -1085,13 +1210,17 @@ def _predict_ensemble_future(series, winner, n_steps, exog_series=None, future_e
         return np.maximum(np.full(n_steps, fallback), 0.0)
     pred_stack = np.vstack(component_preds)
     if winner.get("name") == "Ensemble-Weighted":
-        weight_map = winner.get("component_weights", {}) or {}
-        weights = np.asarray([float(weight_map.get(name, 0.0)) for name in component_order], dtype=float)
+        base_weight_map = winner.get("component_base_weights", {}) or winner.get("component_weights", {}) or {}
+        weights = np.asarray([float(base_weight_map.get(name, 0.0)) for name in component_order], dtype=float)
         if np.sum(weights) <= 0:
             weights = np.asarray([1.0 / pred_stack.shape[0]] * pred_stack.shape[0], dtype=float)
         else:
             weights = weights / np.sum(weights)
-        merged = np.average(pred_stack, axis=0, weights=weights)
+        conservative = str((screening or {}).get("recommendation", "")).lower() != "standard"
+        pseudo_test = pd.Series(series).tail(min(max(n_steps, 8), len(series)))
+        fusion_regime = str(winner.get("fusion_regime") or _infer_fusion_regime(screening, series, pseudo_test, conservative))
+        horizon_weight_matrix = _build_horizon_weight_matrix(component_order, weights, pred_stack.shape[1], fusion_regime)
+        merged = np.sum(pred_stack * horizon_weight_matrix, axis=0)
     else:
         merged = np.mean(pred_stack, axis=0)
     return np.maximum(np.asarray(merged, dtype=float), 0.0)
