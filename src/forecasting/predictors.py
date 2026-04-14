@@ -145,6 +145,88 @@ def calculate_wmape(y_true, y_pred, min_non_zero_points=1):
     return float(min(value, MAX_WMAPE_CAP))
 
 
+def _safe_nonzero_mean(values):
+    arr = np.asarray(values, dtype=float).flatten()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 1.0
+    nz = arr[np.abs(arr) > 1e-9]
+    if nz.size == 0:
+        return max(float(np.mean(np.abs(arr))), 1.0)
+    return max(float(np.mean(np.abs(nz))), 1.0)
+
+
+def _compute_prediction_quality(y_true, y_pred):
+    actual = np.asarray(y_true, dtype=float).flatten()
+    pred = np.asarray(y_pred, dtype=float).flatten()
+    n = min(len(actual), len(pred))
+    if n == 0:
+        return {"quality_score": float("inf")}
+    actual = actual[:n]
+    pred = np.maximum(pred[:n], 0.0)
+
+    scale = _safe_nonzero_mean(actual)
+    mae_scaled = float(np.mean(np.abs(actual - pred)) / scale)
+    mean_actual = float(np.mean(actual)) if n > 0 else 0.0
+    mean_pred = float(np.mean(pred)) if n > 0 else 0.0
+    over_bias = max(mean_pred - mean_actual, 0.0) / max(scale, 1.0)
+
+    actual_zero_ratio = float(np.mean(actual <= 1e-9))
+    pred_zero_ratio = float(np.mean(pred <= 1e-9))
+    zero_mismatch = abs(actual_zero_ratio - pred_zero_ratio)
+
+    actual_diff = np.diff(actual) if n > 1 else np.array([0.0])
+    pred_diff = np.diff(pred) if n > 1 else np.array([0.0])
+    actual_vol = float(np.mean(np.abs(actual_diff)))
+    pred_vol = float(np.mean(np.abs(pred_diff)))
+    volatility_gap = abs(pred_vol - actual_vol) / max(scale, 1.0)
+
+    quality_score = (
+        0.45 * mae_scaled
+        + 0.20 * over_bias
+        + 0.20 * zero_mismatch
+        + 0.15 * volatility_gap
+    )
+    return {
+        "quality_score": float(quality_score),
+        "mae_scaled": float(mae_scaled),
+        "over_bias": float(over_bias),
+        "zero_mismatch": float(zero_mismatch),
+        "volatility_gap": float(volatility_gap),
+    }
+
+
+def _model_effective_score(model):
+    wmape = float(model.get("wmape", MAX_WMAPE_CAP))
+    quality = float(model.get("quality_score", wmape))
+    if not np.isfinite(wmape):
+        wmape = MAX_WMAPE_CAP
+    if not np.isfinite(quality):
+        quality = wmape
+    return float(0.75 * wmape + 0.25 * quality)
+
+
+def _compute_diversity_boost(model_preds, test_series):
+    if len(model_preds) <= 1:
+        return [1.0] * len(model_preds)
+    scale = _safe_nonzero_mean(test_series)
+    boosts = []
+    for i, preds in enumerate(model_preds):
+        distances = []
+        for j, other in enumerate(model_preds):
+            if i == j:
+                continue
+            m = min(len(preds), len(other))
+            if m == 0:
+                continue
+            distances.append(float(np.mean(np.abs(np.asarray(preds[:m]) - np.asarray(other[:m])))))
+        avg_distance = float(np.mean(distances)) if distances else 0.0
+        # Encourage diversity but cap effect to avoid instability.
+        boost = 1.0 + min(avg_distance / max(scale, 1.0), 0.2)
+        boosts.append(boost)
+    return boosts
+
+
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     if Prophet is None:
         if verbose:
@@ -201,7 +283,16 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
         if regime["zero_heavy"]:
             y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.2, 1.0))
         wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
-        return {'name': 'Prophet', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.params if hasattr(model, 'params') else {}}
+        quality = _compute_prediction_quality(test.values, y_pred)
+        return {
+            'name': 'Prophet',
+            'wmape': wmape,
+            'quality_score': quality["quality_score"],
+            'diagnostics': quality,
+            'preds': y_pred,
+            'model': model,
+            'params': model.params if hasattr(model, 'params') else {}
+        }
     except Exception as e:
         if verbose:
             print(f"Prophet 澶辫触: {e}")
@@ -225,21 +316,23 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
             return None
             
         X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
+        train_cv = float(np.std(train.values) / max(np.mean(np.abs(train.values)), 1.0))
+        history = int(regime["history_weeks"])
         params = {
-            "n_estimators": 300,
-            "max_depth": 4,
-            "learning_rate": 0.05,
-            "subsample": 0.85,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 4,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
+            "n_estimators": 260 if history < 80 else 340,
+            "max_depth": 4 if train_cv < 1.1 else 5,
+            "learning_rate": 0.06 if history < 80 else 0.045,
+            "subsample": 0.88 if train_cv < 1.0 else 0.82,
+            "colsample_bytree": 0.82,
+            "min_child_weight": 4 if history >= 80 else 3,
+            "reg_alpha": 0.08 if train_cv < 1.0 else 0.12,
+            "reg_lambda": 1.1,
             "objective": "reg:squarederror",
             "random_state": 42,
             "n_jobs": -1,
         }
         if regime["zero_heavy"]:
-            params.update({"max_depth": 3, "min_child_weight": 6, "learning_rate": 0.03})
+            params.update({"max_depth": 3, "min_child_weight": 7, "learning_rate": 0.03, "subsample": 0.8})
         model = XGBRegressor(**params)
         eval_set = None
         fit_kwargs = {"verbose": False}
@@ -260,7 +353,16 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
         if regime["zero_heavy"]:
             y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.5, 1.0))
         wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
-        return {'name': 'XGBoost', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
+        quality = _compute_prediction_quality(test.values, y_pred)
+        return {
+            'name': 'XGBoost',
+            'wmape': wmape,
+            'quality_score': quality["quality_score"],
+            'diagnostics': quality,
+            'preds': y_pred,
+            'model': model,
+            'params': model.get_params()
+        }
     except Exception as e:
         if verbose:
             print(f"XGBoost 澶辫触: {e}")
@@ -286,21 +388,23 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
             return None
             
         X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
+        train_cv = float(np.std(train.values) / max(np.mean(np.abs(train.values)), 1.0))
+        history = int(regime["history_weeks"])
         params = {
-            "n_estimators": 300,
+            "n_estimators": 280 if history < 80 else 360,
             "max_depth": -1,
-            "num_leaves": 31,
-            "learning_rate": 0.05,
-            "subsample": 0.85,
-            "colsample_bytree": 0.8,
-            "min_child_samples": 10,
-            "reg_alpha": 0.1,
+            "num_leaves": 31 if train_cv < 1.2 else 39,
+            "learning_rate": 0.055 if history < 80 else 0.04,
+            "subsample": 0.88 if train_cv < 1.0 else 0.82,
+            "colsample_bytree": 0.82,
+            "min_child_samples": 10 if history >= 80 else 8,
+            "reg_alpha": 0.08 if train_cv < 1.0 else 0.12,
             "reg_lambda": 1.0,
             "random_state": 42,
             "n_jobs": -1,
         }
         if regime["zero_heavy"]:
-            params.update({"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 15})
+            params.update({"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 16, "subsample": 0.8})
         model = LGBMRegressor(**params)
         fit_kwargs = {"verbose": -1}
         if len(X_train) >= 20:
@@ -319,7 +423,16 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
         if regime["zero_heavy"]:
             y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.5, 1.0))
         wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
-        return {'name': 'LightGBM', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
+        quality = _compute_prediction_quality(test.values, y_pred)
+        return {
+            'name': 'LightGBM',
+            'wmape': wmape,
+            'quality_score': quality["quality_score"],
+            'diagnostics': quality,
+            'preds': y_pred,
+            'model': model,
+            'params': model.get_params()
+        }
     except Exception as e:
         if verbose:
             print(f"LightGBM 澶辫触: {e}")
@@ -346,6 +459,12 @@ def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False, 
             exogenous=exog,
             seasonal=seasonal and m > 1,
             m=m,
+            start_p=0,
+            start_q=0,
+            max_p=3 if regime["history_weeks"] < 104 else 5,
+            max_q=3 if regime["history_weeks"] < 104 else 5,
+            max_P=1 if m <= 13 else 2,
+            max_Q=1 if m <= 13 else 2,
             trace=False,
             error_action='ignore',
             suppress_warnings=True,
@@ -357,7 +476,16 @@ def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False, 
         if regime["zero_heavy"]:
             y_pred = np.minimum(y_pred, max(regime["recent_mean"] * 1.2, 1.0))
         wmape = calculate_wmape(test.values, y_pred, min_non_zero_points=4)
-        return {'name': 'AutoARIMA', 'wmape': wmape, 'preds': y_pred, 'model': model, 'params': model.get_params()}
+        quality = _compute_prediction_quality(test.values, y_pred)
+        return {
+            'name': 'AutoARIMA',
+            'wmape': wmape,
+            'quality_score': quality["quality_score"],
+            'diagnostics': quality,
+            'preds': y_pred,
+            'model': model,
+            'params': model.get_params()
+        }
     except Exception as e:
         if verbose:
             print(f"AutoARIMA 澶辫触: {e}")
@@ -399,7 +527,16 @@ def run_seasonal_naive(train, test, train_exog=None, test_exog=None, verbose=Fal
 
         forecast = np.maximum(forecast, 0)
         wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
-        return {"name": "SeasonalNaive", "wmape": wmape, "preds": forecast, "model": None, "params": {"season_length": season_length}}
+        quality = _compute_prediction_quality(test.values, forecast)
+        return {
+            "name": "SeasonalNaive",
+            "wmape": wmape,
+            "quality_score": quality["quality_score"],
+            "diagnostics": quality,
+            "preds": forecast,
+            "model": None,
+            "params": {"season_length": season_length},
+        }
     except Exception as e:
         if verbose:
             print(f"SeasonalNaive 澶辫触: {e}")
@@ -410,9 +547,12 @@ def run_zero_aware_naive(train, test, train_exog=None, test_exog=None, verbose=F
     try:
         forecast = _build_zero_aware_forecast(train, len(test), screening)
         wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        quality = _compute_prediction_quality(test.values, forecast)
         return {
             "name": "ZeroAwareNaive",
             "wmape": wmape,
+            "quality_score": quality["quality_score"],
+            "diagnostics": quality,
             "preds": forecast,
             "model": None,
             "params": {"strategy": "zero_aware"},
@@ -463,9 +603,12 @@ def run_croston_sba(train, test, train_exog=None, test_exog=None, verbose=False,
             forecast = np.minimum(forecast, cap)
         forecast = np.maximum(forecast, 0)
         wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        quality = _compute_prediction_quality(test.values, forecast)
         return {
             "name": "CrostonSBA",
             "wmape": wmape,
+            "quality_score": quality["quality_score"],
+            "diagnostics": quality,
             "preds": forecast,
             "model": None,
             "params": {"alpha": 0.15, "variant": "SBA"},
@@ -505,9 +648,12 @@ def run_low_signal_median(train, test, train_exog=None, test_exog=None, verbose=
 
         forecast = np.maximum(forecast, 0.0)
         wmape = calculate_wmape(test.values, forecast, min_non_zero_points=4)
+        quality = _compute_prediction_quality(test.values, forecast)
         return {
             "name": "LowSignalMedian",
             "wmape": wmape,
+            "quality_score": quality["quality_score"],
+            "diagnostics": quality,
             "preds": forecast,
             "model": None,
             "params": {"strategy": "recent_median", "recent_window": int(len(recent))},
@@ -607,57 +753,7 @@ def run_all_models(
 
     _emit_model_log(log_fn, f"\n基础模型运行完成: {len(base_models)}/{len(enabled_base_models)} 个成功")
 
-    if len(base_models) >= 2:
-        _emit_model_log(log_fn, "运行融合算法...")
-
-        avg_components = [m["name"] for m in base_models]
-        avg_forecast = np.mean([m["preds"] for m in base_models], axis=0)
-        avg_wmape = calculate_wmape(test, avg_forecast, min_non_zero_points=4)
-        models.append(
-            {
-                "name": "Ensemble-Avg",
-                "stage": "ensemble",
-                "preds": avg_forecast,
-                "wmape": avg_wmape,
-                "model": None,
-                "component_models": avg_components,
-                "component_weights": {name: 1.0 / len(avg_components) for name in avg_components},
-            }
-        )
-        _emit_model_log(log_fn, f"Ensemble-Avg: WMAPE={avg_wmape:.2%}")
-
-        inv_weights = [1.0 / m["wmape"] if np.isfinite(m["wmape"]) and m["wmape"] > 0 else 0.0 for m in base_models]
-        weight_sum = float(sum(inv_weights))
-        if weight_sum > 0:
-            weights = [w / weight_sum for w in inv_weights]
-            base_models_for_weighted = list(base_models)
-            weighted_forecast = np.average(
-                [m["preds"] for m in base_models_for_weighted],
-                axis=0,
-                weights=weights,
-            )
-            weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
-            component_weights = {
-                base_models_for_weighted[idx]["name"]: float(weights[idx])
-                for idx in range(len(base_models_for_weighted))
-            }
-            models.append(
-                {
-                    "name": "Ensemble-Weighted",
-                    "stage": "ensemble",
-                    "preds": weighted_forecast,
-                    "wmape": weighted_wmape,
-                    "model": None,
-                    "component_models": [m["name"] for m in base_models_for_weighted],
-                    "component_weights": component_weights,
-                }
-            )
-            _emit_model_log(log_fn, f"Ensemble-Weighted: WMAPE={weighted_wmape:.2%}")
-
-        _emit_model_log(log_fn, "融合算法运行完成")
-    else:
-        _emit_model_log(log_fn, "基础模型不足 2 个，跳过融合算法")
-
+    # Build robust candidates first so fusion can include them.
     zero_naive_result = run_zero_aware_naive(train, test, train_exog, test_exog, verbose, screening=screening)
     if zero_naive_result:
         zero_naive_result["stage"] = "robust"
@@ -685,6 +781,79 @@ def run_all_models(
         models.append(seasonal_naive_result)
         robust_models.append(seasonal_naive_result)
         _emit_model_log(log_fn, f"SeasonalNaive: WMAPE={seasonal_naive_result['wmape']:.2%}")
+
+    # Fusion pool strategy:
+    # - standard: base models + best robust model
+    # - conservative: all atomic models (base + robust)
+    robust_models = [m for m in robust_models if m is not None]
+    fusion_pool = list(base_models)
+    if conservative:
+        fusion_pool = [m for m in (base_models + robust_models) if m is not None]
+    elif robust_models:
+        best_robust = min(robust_models, key=_model_effective_score)
+        fusion_pool.append(best_robust)
+
+    if len(fusion_pool) >= 2:
+        _emit_model_log(log_fn, "运行融合算法...")
+
+        avg_components = [m["name"] for m in fusion_pool]
+        avg_forecast = np.mean([m["preds"] for m in fusion_pool], axis=0)
+        avg_wmape = calculate_wmape(test, avg_forecast, min_non_zero_points=4)
+        avg_quality = _compute_prediction_quality(test, avg_forecast)
+        models.append(
+            {
+                "name": "Ensemble-Avg",
+                "stage": "ensemble",
+                "preds": avg_forecast,
+                "wmape": avg_wmape,
+                "quality_score": avg_quality["quality_score"],
+                "diagnostics": avg_quality,
+                "model": None,
+                "component_models": avg_components,
+                "component_weights": {name: 1.0 / len(avg_components) for name in avg_components},
+            }
+        )
+        _emit_model_log(log_fn, f"Ensemble-Avg: WMAPE={avg_wmape:.2%}")
+
+        effective_scores = [_model_effective_score(m) for m in fusion_pool]
+        inv_weights = [1.0 / max(score, 1e-6) if np.isfinite(score) else 0.0 for score in effective_scores]
+        weight_sum = float(sum(inv_weights))
+        if weight_sum > 0:
+            weights = [w / weight_sum for w in inv_weights]
+            diversity_boost = _compute_diversity_boost([m["preds"] for m in fusion_pool], test.values)
+            weights = [weights[i] * diversity_boost[i] for i in range(len(weights))]
+            boost_sum = float(sum(weights))
+            weights = [w / boost_sum for w in weights] if boost_sum > 0 else [1.0 / len(fusion_pool)] * len(fusion_pool)
+            base_models_for_weighted = list(fusion_pool)
+            weighted_forecast = np.average(
+                [m["preds"] for m in base_models_for_weighted],
+                axis=0,
+                weights=weights,
+            )
+            weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
+            weighted_quality = _compute_prediction_quality(test, weighted_forecast)
+            component_weights = {
+                base_models_for_weighted[idx]["name"]: float(weights[idx])
+                for idx in range(len(base_models_for_weighted))
+            }
+            models.append(
+                {
+                    "name": "Ensemble-Weighted",
+                    "stage": "ensemble",
+                    "preds": weighted_forecast,
+                    "wmape": weighted_wmape,
+                    "quality_score": weighted_quality["quality_score"],
+                    "diagnostics": weighted_quality,
+                    "model": None,
+                    "component_models": [m["name"] for m in base_models_for_weighted],
+                    "component_weights": component_weights,
+                }
+            )
+            _emit_model_log(log_fn, f"Ensemble-Weighted: WMAPE={weighted_wmape:.2%}")
+
+        _emit_model_log(log_fn, "融合算法运行完成")
+    else:
+        _emit_model_log(log_fn, "基础模型不足 2 个，跳过融合算法")
 
     # Base results are used by future prediction stage; keep atomic models only.
     atomic_models = [m for m in models if not str(m.get("name", "")).startswith("Ensemble")]
