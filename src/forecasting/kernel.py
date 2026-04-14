@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from src.forecasting.models import SPUProfiler
 from src.forecasting.sample_screening import screen_weekly_series
 from src.forecasting.predictors import (
+    calculate_wmape,
     clean_params_for_db,
     clean_series,
     extract_seasonal_factors_52week,
@@ -166,6 +167,53 @@ def _standard_model_score(model: dict, test_series: pd.Series) -> float:
 
     # Lighter than conservative score, used only for close-call decisions.
     return wmape + 0.12 * over_bias + 0.08 * pred_jump + 0.06 * zero_mismatch
+
+
+def _low_signal_model_score(model: dict, test_series: pd.Series, history_series: pd.Series) -> float:
+    """Ranking score for sparse validation windows.
+
+    In low-signal windows, many models hit the capped WMAPE (9.999), so we add
+    penalties that favor conservative, non-explosive trajectories.
+    """
+    preds = np.asarray(model.get("preds", []), dtype=float).flatten()
+    actual = np.asarray(test_series.values, dtype=float).flatten()
+    n = min(len(preds), len(actual))
+    if n == 0:
+        return float("inf")
+    preds = np.maximum(preds[:n], 0.0)
+    actual = actual[:n]
+
+    # Soft WMAPE uses relaxed non-zero requirement, useful for sparse windows.
+    soft_wmape = float(calculate_wmape(actual, preds, min_non_zero_points=1))
+    if not np.isfinite(soft_wmape):
+        soft_wmape = 9.999
+
+    hard_wmape = float(model.get("wmape", 9.999))
+    if not np.isfinite(hard_wmape):
+        hard_wmape = 9.999
+
+    hist = pd.Series(history_series).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    recent = hist.tail(min(12, len(hist))) if not hist.empty else pd.Series(dtype=float)
+    recent_non_zero = recent[recent > 0]
+    scale = float(recent_non_zero.median()) if not recent_non_zero.empty else float(recent.mean()) if not recent.empty else 1.0
+    scale = max(scale, 1.0)
+
+    mae_all = float(np.mean(np.abs(preds - actual)))
+    zero_idx = actual <= 1e-6
+    over_on_zero = float(np.mean(preds[zero_idx])) if np.any(zero_idx) else 0.0
+    pred_zero_ratio = float(np.mean(preds <= 1e-6))
+    actual_zero_ratio = float(np.mean(actual <= 1e-6))
+    zero_mismatch = abs(pred_zero_ratio - actual_zero_ratio)
+
+    # Extra penalty when model is in "hard-capped" error regime.
+    cap_penalty = 0.35 if hard_wmape >= 9.0 else 0.0
+    return (
+        0.55 * soft_wmape
+        + 0.20 * (mae_all / scale)
+        + 0.15 * (over_on_zero / scale)
+        + 0.10 * zero_mismatch
+        + cap_penalty
+    )
 
 
 def _best_ensemble_candidate(valid_results: list[dict]) -> dict | None:
@@ -350,37 +398,51 @@ def process_single_spu(
             all_results = valid_results
             if model_policy == "conservative":
                 wmape_best_candidate = min(valid_results, key=lambda item: float(item.get("wmape", float("inf"))))
-                shortlist = _conservative_shortlist(valid_results, wmape_margin=0.015)
-                candidates_for_rank = shortlist if shortlist else valid_results
-                ranked = sorted(
-                    [
-                        (
-                            _conservative_model_score(candidate, test),
-                            candidate,
-                        )
-                        for candidate in candidates_for_rank
-                    ],
-                    key=lambda item: item[0],
-                )
-                winner = ranked[0][1]
-                if log_fn is not None:
-                    score_text = ", ".join(
+                if low_signal_window:
+                    ranked = sorted(
                         [
-                            f"{item[1]['name']}={item[0]:.4f}"
-                            for item in ranked[:4]
-                        ]
+                            (
+                                _low_signal_model_score(candidate, test, series_clean),
+                                candidate,
+                            )
+                            for candidate in valid_results
+                        ],
+                        key=lambda item: item[0],
                     )
-                    log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+                    winner = ranked[0][1]
+                    if log_fn is not None:
+                        score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
+                        log_fn(f"SPU {spu} low-signal model ranking: {score_text}.")
+                else:
+                    shortlist = _conservative_shortlist(valid_results, wmape_margin=0.015)
+                    candidates_for_rank = shortlist if shortlist else valid_results
+                    ranked = sorted(
+                        [
+                            (
+                                _conservative_model_score(candidate, test),
+                                candidate,
+                            )
+                            for candidate in candidates_for_rank
+                        ],
+                        key=lambda item: item[0],
+                    )
+                    winner = ranked[0][1]
+                    if log_fn is not None:
+                        score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
+                        log_fn(f"SPU {spu} conservative model ranking: {score_text}.")
+
                 winner_wmape = float(winner.get("wmape", float("inf")))
                 wmape_best_value = float(wmape_best_candidate.get("wmape", float("inf")))
-                if np.isfinite(winner_wmape) and np.isfinite(wmape_best_value) and winner_wmape > wmape_best_value + 0.015:
-                    winner = wmape_best_candidate
-                    if log_fn is not None:
-                        log_fn(
-                            f"SPU {spu} conservative wmape guardrail activated: "
-                            f"use {winner['name']} ({wmape_best_value:.4f}) "
-                            f"instead of higher-error candidate ({winner_wmape:.4f})."
-                        )
+                if np.isfinite(winner_wmape) and np.isfinite(wmape_best_value):
+                    guard_margin = 0.02 if low_signal_window else 0.015
+                    if winner_wmape > wmape_best_value + guard_margin:
+                        winner = wmape_best_candidate
+                        if log_fn is not None:
+                            log_fn(
+                                f"SPU {spu} conservative wmape guardrail activated: "
+                                f"use {winner['name']} ({wmape_best_value:.4f}) "
+                                f"instead of higher-error candidate ({winner_wmape:.4f})."
+                            )
                 # Hybrid bridge: when signal is not extremely sparse, allow
                 # stable ensemble to win if its error is close to conservative winner.
                 ensemble_candidate = _best_ensemble_candidate(valid_results)
