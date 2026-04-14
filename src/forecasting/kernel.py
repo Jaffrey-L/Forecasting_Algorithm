@@ -228,6 +228,34 @@ def _best_ensemble_candidate(valid_results: list[dict]) -> dict | None:
     return min(ensemble_candidates, key=lambda item: float(item.get("wmape", float("inf"))))
 
 
+def _low_signal_model_priority(model_name: str) -> int:
+    order = {
+        "LowSignalMedian": 0,
+        "ZeroAwareNaive": 1,
+        "CrostonSBA": 2,
+        "SeasonalNaive": 3,
+        "AutoARIMA": 4,
+        "Ensemble-Weighted": 5,
+        "Ensemble-Avg": 6,
+        "LightGBM": 7,
+        "XGBoost": 8,
+        "Prophet": 9,
+    }
+    return order.get(str(model_name), 99)
+
+
+def _zero_validation_proxy_error(preds: np.ndarray, train_series: pd.Series) -> float:
+    clean_train = pd.Series(train_series).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if clean_train.empty:
+        return 9.999
+    anchor = float(clean_train.tail(min(12, len(clean_train))).mean())
+    anchor = max(anchor, 1.0)
+    mae = float(np.mean(np.abs(np.asarray(preds, dtype=float).flatten())))
+    if not np.isfinite(mae):
+        return 9.999
+    return float(min(mae / anchor, 9.999))
+
+
 def _conservative_shortlist(valid_results: list[dict], wmape_margin: float = 0.015) -> list[dict]:
     finite_candidates = [
         candidate
@@ -403,15 +431,16 @@ def process_single_spu(
                         [
                             (
                                 _low_signal_model_score(candidate, test, series_clean),
+                                _low_signal_model_priority(candidate.get("name", "")),
                                 candidate,
                             )
                             for candidate in valid_results
                         ],
-                        key=lambda item: item[0],
+                        key=lambda item: (item[0], item[1]),
                     )
-                    winner = ranked[0][1]
+                    winner = ranked[0][2]
                     if log_fn is not None:
-                        score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
+                        score_text = ", ".join([f"{item[2]['name']}={item[0]:.4f}" for item in ranked[:4]])
                         log_fn(f"SPU {spu} low-signal model ranking: {score_text}.")
                 else:
                     shortlist = _conservative_shortlist(valid_results, wmape_margin=0.015)
@@ -467,6 +496,28 @@ def process_single_spu(
                                 f"choose {winner['name']} ({ensemble_wmape:.4f}) "
                                 f"over conservative winner ({winner_wmape:.4f})."
                             )
+
+                # Zero-validation-window fallback:
+                # when all validation points are zero, regular WMAPE is not informative.
+                if validation_non_zero_points == 0:
+                    preferred = ["ZeroAwareNaive", "LowSignalMedian", "CrostonSBA", "SeasonalNaive"]
+                    fallback = None
+                    for model_name in preferred:
+                        fallback = next((item for item in valid_results if item.get("name") == model_name), None)
+                        if fallback is not None:
+                            break
+                    if fallback is not None:
+                        winner = fallback
+                    # Replace capped WMAPE with proxy error ratio for observability.
+                    proxy_wmape = _zero_validation_proxy_error(np.asarray(winner.get("preds", []), dtype=float), train)
+                    winner = dict(winner)
+                    winner["wmape"] = proxy_wmape
+                    winner["wmape_metric"] = "proxy_zero_validation"
+                    if log_fn is not None:
+                        log_fn(
+                            f"SPU {spu} zero-validation fallback: choose {winner['name']} "
+                            f"with proxy error ratio {proxy_wmape:.4f} (validation_non_zero_points=0)."
+                        )
             else:
                 wmape_ranked = sorted(valid_results, key=lambda item: item.get("wmape", float("inf")))
                 winner = wmape_ranked[0]
