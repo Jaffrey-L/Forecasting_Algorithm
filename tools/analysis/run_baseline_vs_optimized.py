@@ -151,7 +151,7 @@ payload = {
     "records": records,
     "failures": failures,
 }
-print("AB_RESULT_JSON=" + json.dumps(payload, ensure_ascii=False))
+print("AB_RESULT_JSON=" + json.dumps(payload, ensure_ascii=True))
 """
 
 
