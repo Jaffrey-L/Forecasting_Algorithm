@@ -18,6 +18,10 @@ from src.forecasting.models import *
 
 forecast_kernel = None
 MAX_WMAPE_CAP = 9.999
+ENSEMBLE_GUARDRAIL_WMAPE_DELTA = 0.015
+ENSEMBLE_GUARDRAIL_P95_FACTOR = 1.10
+ENSEMBLE_GUARDRAIL_P95_DELTA = 0.02
+ENSEMBLE_GUARDRAIL_OVER_RATIO_DELTA = 0.03
 _PROPHET_RUNTIME_FAILURES = 0
 _PROPHET_LAST_FAILURE_REASON = ""
 _PROPHET_RUNTIME_FAILURE_LIMIT = 5
@@ -193,11 +197,36 @@ def _compute_prediction_quality(y_true, y_pred):
     pred_vol = float(np.mean(np.abs(pred_diff)))
     volatility_gap = abs(pred_vol - actual_vol) / max(scale, 1.0)
 
+    mask_non_zero = actual > 1e-9
+    if np.any(mask_non_zero):
+        ape = np.abs(actual[mask_non_zero] - pred[mask_non_zero]) / np.maximum(np.abs(actual[mask_non_zero]), 1e-9)
+        p90_ape = float(np.percentile(ape, 90))
+        p95_ape = float(np.percentile(ape, 95))
+        over_forecast_rate = float(np.mean((pred[mask_non_zero] - actual[mask_non_zero]) > 0))
+        over_forecast_ratio = float(
+            np.sum(np.maximum(pred[mask_non_zero] - actual[mask_non_zero], 0.0))
+            / np.sum(np.abs(actual[mask_non_zero]))
+        )
+    else:
+        p90_ape = 0.0
+        p95_ape = 0.0
+        over_forecast_rate = 0.0
+        over_forecast_ratio = 0.0
+
+    # Business-leaning asymmetric penalty: over-forecast is slightly more expensive.
+    asym_cost = (
+        np.maximum(pred - actual, 0.0) * 1.2
+        + np.maximum(actual - pred, 0.0) * 1.0
+    )
+    asym_loss = float(np.mean(asym_cost) / max(scale, 1.0))
     quality_score = (
-        0.45 * mae_scaled
-        + 0.20 * over_bias
-        + 0.20 * zero_mismatch
-        + 0.15 * volatility_gap
+        0.35 * mae_scaled
+        + 0.15 * over_bias
+        + 0.15 * zero_mismatch
+        + 0.10 * volatility_gap
+        + 0.15 * asym_loss
+        + 0.05 * p90_ape
+        + 0.05 * p95_ape
     )
     return {
         "quality_score": float(quality_score),
@@ -205,17 +234,110 @@ def _compute_prediction_quality(y_true, y_pred):
         "over_bias": float(over_bias),
         "zero_mismatch": float(zero_mismatch),
         "volatility_gap": float(volatility_gap),
+        "asym_loss": float(asym_loss),
+        "p90_ape": float(p90_ape),
+        "p95_ape": float(p95_ape),
+        "over_forecast_rate": float(over_forecast_rate),
+        "over_forecast_ratio": float(over_forecast_ratio),
     }
 
 
 def _model_effective_score(model):
     wmape = float(model.get("wmape", MAX_WMAPE_CAP))
     quality = float(model.get("quality_score", wmape))
+    diagnostics = model.get("diagnostics") or {}
+    p95_ape = float(diagnostics.get("p95_ape", 0.0))
+    over_forecast_ratio = float(diagnostics.get("over_forecast_ratio", 0.0))
     if not np.isfinite(wmape):
         wmape = MAX_WMAPE_CAP
     if not np.isfinite(quality):
         quality = wmape
-    return float(0.75 * wmape + 0.25 * quality)
+    if not np.isfinite(p95_ape):
+        p95_ape = 0.0
+    if not np.isfinite(over_forecast_ratio):
+        over_forecast_ratio = 0.0
+    risk_penalty = 0.10 * p95_ape + 0.08 * over_forecast_ratio
+    return float(0.68 * wmape + 0.22 * quality + risk_penalty)
+
+
+def _ensemble_guardrail_reasons(candidate, best_component):
+    candidate_diag = candidate.get("diagnostics") or {}
+    best_diag = best_component.get("diagnostics") or {}
+    candidate_wmape = float(candidate.get("wmape", MAX_WMAPE_CAP))
+    best_wmape = float(best_component.get("wmape", MAX_WMAPE_CAP))
+    candidate_p95 = float(candidate_diag.get("p95_ape", 0.0))
+    best_p95 = float(best_diag.get("p95_ape", 0.0))
+    candidate_over = float(candidate_diag.get("over_forecast_ratio", 0.0))
+    best_over = float(best_diag.get("over_forecast_ratio", 0.0))
+
+    reasons = []
+    if np.isfinite(best_wmape) and np.isfinite(candidate_wmape):
+        if candidate_wmape > best_wmape + ENSEMBLE_GUARDRAIL_WMAPE_DELTA:
+            reasons.append(
+                f"wmape {candidate_wmape:.2%} > {best_wmape:.2%} + {ENSEMBLE_GUARDRAIL_WMAPE_DELTA:.2%}"
+            )
+    if np.isfinite(best_p95) and np.isfinite(candidate_p95):
+        p95_limit = best_p95 * ENSEMBLE_GUARDRAIL_P95_FACTOR + ENSEMBLE_GUARDRAIL_P95_DELTA
+        if candidate_p95 > p95_limit:
+            reasons.append(
+                f"p95_ape {candidate_p95:.2%} > {p95_limit:.2%}"
+            )
+    if np.isfinite(best_over) and np.isfinite(candidate_over):
+        over_limit = best_over + ENSEMBLE_GUARDRAIL_OVER_RATIO_DELTA
+        if candidate_over > over_limit:
+            reasons.append(
+                f"over_ratio {candidate_over:.2%} > {over_limit:.2%}"
+            )
+    return reasons
+
+
+def _get_model_diagnostics(model):
+    diagnostics = model.get("diagnostics") or {}
+    wmape = float(model.get("wmape", MAX_WMAPE_CAP))
+    p95_ape = float(diagnostics.get("p95_ape", 0.0))
+    over_forecast_ratio = float(diagnostics.get("over_forecast_ratio", 0.0))
+    if not np.isfinite(wmape):
+        wmape = MAX_WMAPE_CAP
+    if not np.isfinite(p95_ape):
+        p95_ape = 0.0
+    if not np.isfinite(over_forecast_ratio):
+        over_forecast_ratio = 0.0
+    return {
+        "wmape": wmape,
+        "p95_ape": p95_ape,
+        "over_forecast_ratio": over_forecast_ratio,
+    }
+
+
+def _filter_fusion_pool_outliers(models):
+    """
+    Keep fusion diversity but remove clearly dominated models that tend to
+    amplify tail error and over-forecast risk.
+    """
+    if len(models) <= 2:
+        return models
+    wmape_arr = []
+    p95_arr = []
+    over_arr = []
+    for m in models:
+        diag = _get_model_diagnostics(m)
+        wmape_arr.append(diag["wmape"])
+        p95_arr.append(diag["p95_ape"])
+        over_arr.append(diag["over_forecast_ratio"])
+    wmape_med = float(np.median(wmape_arr))
+    p95_med = float(np.median(p95_arr))
+    over_med = float(np.median(over_arr))
+    kept = []
+    for m in models:
+        diag = _get_model_diagnostics(m)
+        wmape_bad = diag["wmape"] > max(wmape_med * 1.25, wmape_med + 0.02)
+        p95_bad = diag["p95_ape"] > max(p95_med * 1.35, p95_med + 0.10)
+        over_bad = diag["over_forecast_ratio"] > max(over_med * 1.35, over_med + 0.04)
+        # Drop only when multi-dimensional risk is jointly bad.
+        if (wmape_bad and p95_bad) or (wmape_bad and over_bad):
+            continue
+        kept.append(m)
+    return kept if len(kept) >= 2 else models
 
 
 def _compute_diversity_boost(model_preds, test_series):
@@ -972,6 +1094,7 @@ def run_all_models(
         best_robust = min(robust_models, key=_model_effective_score)
         fusion_pool.append(best_robust)
 
+    fusion_pool = _filter_fusion_pool_outliers([m for m in fusion_pool if m is not None])
     if len(fusion_pool) >= 2:
         _emit_model_log(log_fn, "运行融合算法...")
         fusion_regime = _infer_fusion_regime(screening, train, test, conservative)
@@ -1015,18 +1138,42 @@ def run_all_models(
             weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
             weighted_quality = _compute_prediction_quality(test, weighted_forecast)
 
-            # Quality guardrail: weighted fusion should not be materially worse than
-            # the best atomic candidate on validation.
+            # Triple guardrail: fallback when weighted fusion is materially worse
+            # on WMAPE / tail error / over-forecast.
             best_component = min(base_models_for_weighted, key=lambda item: float(item.get("wmape", MAX_WMAPE_CAP)))
-            best_component_wmape = float(best_component.get("wmape", MAX_WMAPE_CAP))
-            if np.isfinite(best_component_wmape) and weighted_wmape > best_component_wmape + 0.015:
+            best_diag = _get_model_diagnostics(best_component)
+            weighted_diag = _get_model_diagnostics(
+                {
+                    "wmape": weighted_wmape,
+                    "diagnostics": weighted_quality,
+                }
+            )
+            guardrail_reasons = _ensemble_guardrail_reasons(
+                {
+                    "wmape": weighted_diag["wmape"],
+                    "diagnostics": {
+                        "p95_ape": weighted_diag["p95_ape"],
+                        "over_forecast_ratio": weighted_diag["over_forecast_ratio"],
+                    },
+                },
+                {
+                    "wmape": best_diag["wmape"],
+                    "diagnostics": {
+                        "p95_ape": best_diag["p95_ape"],
+                        "over_forecast_ratio": best_diag["over_forecast_ratio"],
+                    },
+                },
+            )
+            if guardrail_reasons:
                 weighted_forecast = np.asarray(best_component["preds"], dtype=float)
                 weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)
                 weighted_quality = _compute_prediction_quality(test, weighted_forecast)
                 _emit_model_log(
                     log_fn,
-                    f"Ensemble-Weighted guardrail: fallback to {best_component['name']} "
-                    f"(wmape={best_component_wmape:.2%})",
+                    "Ensemble-Weighted guardrail: fallback to "
+                    f"{best_component['name']} (wmape={best_diag['wmape']:.2%}, "
+                    f"p95_ape={best_diag['p95_ape']:.2%}, over_ratio={best_diag['over_forecast_ratio']:.2%}, "
+                    f"reasons={' | '.join(guardrail_reasons)})",
                 )
 
             component_weights = {
