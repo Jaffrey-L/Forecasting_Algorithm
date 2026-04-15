@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ DEFAULT_SCOPE_MIN_RECENT4_TOTAL_SALES = 4.0
 ACTIVE_RUN_STATUSES = {"queued", "running", "stopping"}
 SCHEDULER_POLL_SECONDS = 30
 SCHEDULER_RECOVERY_WAIT_SECONDS = 5
+DEFAULT_SPU_TIMEOUT_SECONDS = int(os.getenv("SPU_EXEC_TIMEOUT_SECONDS", "1800"))
 
 logger = logging.getLogger(__name__)
 
@@ -381,16 +383,55 @@ class ForecastRuntimeManager:
                 self._append_log(run_id, "info", f"[SPU {spu}] 模型竞赛准备开始。")
                 self._append_log(run_id, "info", f"[SPU {spu}] Model competition starting.")
                 df_spu = df_all[df_all["spu"] == spu].copy()
-                result_df, message, _viz, _profile = process_single_spu(
-                    spu,
-                    df_spu,
-                    mode=run["mode"],
-                    exog_cols=exog_cols,
-                    collect_viz=False,
-                    verbose=False,
-                    log_fn=lambda line, current_spu=spu: self._append_log(
-                        run_id, "info", f"[SPU {current_spu}] {line}"
-                    ),
+                spu_timed_out = {"value": False}
+                spu_result: Dict[str, Any] = {}
+                spu_error: Dict[str, Exception] = {}
+
+                def _spu_log(line: str, current_spu: str = spu) -> None:
+                    if spu_timed_out["value"]:
+                        return
+                    self._append_log(run_id, "info", f"[SPU {current_spu}] {line}")
+
+                def _spu_worker() -> None:
+                    try:
+                        spu_result["payload"] = process_single_spu(
+                            spu,
+                            df_spu,
+                            mode=run["mode"],
+                            exog_cols=exog_cols,
+                            collect_viz=False,
+                            verbose=False,
+                            log_fn=_spu_log,
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        spu_error["exc"] = exc
+
+                worker = threading.Thread(target=_spu_worker, daemon=True)
+                worker.start()
+                timeout_seconds = max(int(DEFAULT_SPU_TIMEOUT_SECONDS), 60)
+                worker.join(timeout=timeout_seconds)
+                if worker.is_alive():
+                    spu_timed_out["value"] = True
+                    timeout_message = f"SPU execution timeout after {timeout_seconds}s"
+                    failures.append({"spu": spu, "reason": timeout_message})
+                    self.store.upsert_run_spu(run_id, spu, "failed", message=timeout_message)
+                    self._append_log(
+                        run_id,
+                        "warning",
+                        f"[SPU {spu}] {timeout_message}. Marked failed and continue.",
+                    )
+                    self.store.update_run(
+                        run_id,
+                        processed_count=index,
+                        success_count=successful,
+                        progress=int(index / max(total_spus, 1) * 100),
+                    )
+                    continue
+                if "exc" in spu_error:
+                    raise spu_error["exc"]
+                result_df, message, _viz, _profile = spu_result.get(
+                    "payload",
+                    (None, "SPU worker returned no payload", None, None),
                 )
                 if result_df is not None:
                     all_results.append(result_df)
