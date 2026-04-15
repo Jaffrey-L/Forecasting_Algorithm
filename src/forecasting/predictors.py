@@ -1282,7 +1282,14 @@ def _predict_prophet_future(series, n_steps, exog_series=None, future_exog=None)
         return np.maximum(np.full(n_steps, fallback_value), 0.0)
     df = pd.DataFrame({"ds": series.index, "y": series.values})
     if exog_series is not None and not exog_series.empty:
-        aligned = exog_series.reindex(series.index)
+        aligned = (
+            exog_series.reindex(series.index)
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+        )
         for col in aligned.columns:
             df[col] = aligned[col].values
     model = Prophet(
@@ -1297,17 +1304,53 @@ def _predict_prophet_future(series, n_steps, exog_series=None, future_exog=None)
     model.fit(df)
     future = model.make_future_dataframe(periods=n_steps, freq="W")
     if future_exog is not None and not future_exog.empty:
-        for col in future_exog.columns:
+        future_exog_clean = (
+            future_exog.copy()
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+        )
+        if exog_series is not None and not exog_series.empty:
+            hist_exog_clean = (
+                exog_series.copy()
+                .astype(float)
+                .replace([np.inf, -np.inf], np.nan)
+                .ffill()
+                .bfill()
+                .fillna(0.0)
+            )
+        else:
+            hist_exog_clean = None
+        for col in future_exog_clean.columns:
             if exog_series is not None and not exog_series.empty and col in exog_series.columns:
-                hist_exog = exog_series[col].values
-                fut_exog = future_exog[col].values
+                hist_exog = hist_exog_clean[col].values
+                fut_exog = future_exog_clean[col].values
                 all_exog = np.concatenate([hist_exog, fut_exog])
                 if len(all_exog) == len(future):
                     future[col] = all_exog
                 else:
-                    future[col] = np.concatenate([np.full(len(series), np.nan), fut_exog])
+                    # Prophet regressors cannot contain NaN; use history tail mean as fallback.
+                    fallback = float(np.nanmean(hist_exog)) if len(hist_exog) > 0 else 0.0
+                    history_part = np.full(len(series), fallback)
+                    future[col] = np.concatenate([history_part, fut_exog])
             else:
-                future[col] = np.concatenate([np.full(len(series), np.nan), future_exog[col].values])
+                fut_exog = future_exog_clean[col].values
+                history_part = np.full(len(series), float(np.nanmean(fut_exog)) if len(fut_exog) > 0 else 0.0)
+                future[col] = np.concatenate([history_part, fut_exog])
+    for col in future.columns:
+        if col in ("ds",):
+            continue
+        future[col] = (
+            pd.Series(future[col])
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+            .values
+        )
     forecast = model.predict(future)
     return np.maximum(forecast["yhat"].values[-n_steps:], 0)
 
