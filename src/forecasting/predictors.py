@@ -241,6 +241,22 @@ def _infer_fusion_regime(screening, train, test, conservative):
     return "mixed"
 
 
+def _allow_tree_models_in_conservative(screening, train, test):
+    screening = screening or {}
+    zero_ratio = float(screening.get("zero_ratio", 1.0))
+    recent_to_prior_ratio = float(screening.get("recent_to_prior_ratio", 0.0))
+    validation_non_zero = int(np.count_nonzero(np.asarray(test, dtype=float) > 0))
+    history_weeks = int(len(train))
+    # Keep conservative stance, but allow trees to participate when signal
+    # is not extremely sparse/collapsed.
+    return (
+        history_weeks >= 104
+        and validation_non_zero >= 5
+        and zero_ratio <= 0.70
+        and recent_to_prior_ratio >= 0.18
+    )
+
+
 def _fusion_model_gate_factor(model_name, regime):
     name = str(model_name)
     robust = {"ZeroAwareNaive", "LowSignalMedian", "CrostonSBA", "SeasonalNaive"}
@@ -786,6 +802,14 @@ def run_all_models(
     base_models = []
     robust_models = []
     conservative = str(model_policy).lower() == "conservative"
+    allow_trees_under_conservative = _allow_tree_models_in_conservative(screening, train, test)
+    screening_obj = screening or {}
+    conservative_reason = (
+        f"zero_ratio={float(screening_obj.get('zero_ratio', 1.0)):.2f}, "
+        f"recent_to_prior_ratio={float(screening_obj.get('recent_to_prior_ratio', 0.0)):.2f}, "
+        f"validation_non_zero={int(np.count_nonzero(np.asarray(test, dtype=float) > 0))}, "
+        f"history_weeks={len(train)}"
+    )
     enabled_base_models = []
 
     _emit_model_log(log_fn, f"\n模型竞赛启动 (mode={mode})...")
@@ -793,7 +817,7 @@ def run_all_models(
     _emit_model_log(log_fn, "=" * 70)
 
     if conservative:
-        _emit_model_log(log_fn, "跳过 Prophet（conservative 策略）")
+        _emit_model_log(log_fn, f"跳过 Prophet（conservative 策略，{conservative_reason}）")
     else:
         enabled_base_models.append("Prophet")
         prophet_ready, prophet_reason = _check_prophet_runtime()
@@ -810,9 +834,11 @@ def run_all_models(
             else:
                 _emit_model_log(log_fn, "Prophet: 失败")
 
-    if conservative:
-        _emit_model_log(log_fn, "跳过 XGBoost（conservative 策略）")
+    if conservative and not allow_trees_under_conservative:
+        _emit_model_log(log_fn, f"跳过 XGBoost（严格 conservative，{conservative_reason}）")
     else:
+        if conservative and allow_trees_under_conservative:
+            _emit_model_log(log_fn, f"conservative 放宽：允许 XGBoost 参赛（{conservative_reason}）")
         enabled_base_models.append("XGBoost")
         _emit_model_log(log_fn, "运行 XGBoost...")
         xgboost_result = run_xgboost(train, test, train_exog, test_exog, verbose, screening=screening)
@@ -824,9 +850,11 @@ def run_all_models(
         else:
             _emit_model_log(log_fn, "XGBoost: 失败")
 
-    if conservative:
-        _emit_model_log(log_fn, "跳过 LightGBM（conservative 策略）")
+    if conservative and not allow_trees_under_conservative:
+        _emit_model_log(log_fn, f"跳过 LightGBM（严格 conservative，{conservative_reason}）")
     else:
+        if conservative and allow_trees_under_conservative:
+            _emit_model_log(log_fn, f"conservative 放宽：允许 LightGBM 参赛（{conservative_reason}）")
         enabled_base_models.append("LightGBM")
         _emit_model_log(log_fn, "运行 LightGBM...")
         lightgbm_result = run_lightgbm(train, test, train_exog, test_exog, verbose, screening=screening)

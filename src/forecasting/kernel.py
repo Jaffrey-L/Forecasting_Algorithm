@@ -523,22 +523,53 @@ def process_single_spu(
         validation_non_zero_points = int((test > 0).sum())
         validation_total_sales = float(test.sum())
         history_weeks = int(len(series_clean))
-        low_signal_window = validation_non_zero_points < 6 or validation_total_sales < 120
-        model_policy = (
-            "conservative"
-            if screening.get("recommendation") != "standard" or low_signal_window
-            else "standard"
+        recommendation = str(screening.get("recommendation") or "standard").lower()
+        zero_ratio = float(screening.get("zero_ratio", 1.0))
+        recent_to_prior_ratio = float(screening.get("recent_to_prior_ratio", 0.0))
+
+        # Two-tier gate:
+        # - conservative: only for truly extreme low-signal / collapse scenarios
+        # - standard with low-signal guard: for moderate sparse windows, keep full model arena
+        extreme_low_signal = (
+            recommendation == "zero_override"
+            or validation_non_zero_points < 4
+            or validation_total_sales < 60
+            or zero_ratio >= 0.70
+            or recent_to_prior_ratio <= 0.20
         )
-        if log_fn is not None and model_policy == "conservative":
-            log_fn(
-                "SPU {} switched to conservative policy: recommendation={}, "
-                "validation_non_zero_points={}, validation_total_sales={:.2f}.".format(
-                    spu,
-                    screening.get("recommendation"),
-                    validation_non_zero_points,
-                    validation_total_sales,
+        low_signal_window = (
+            validation_non_zero_points < 6
+            or validation_total_sales < 120
+            or recommendation in {"conservative", "zero_override"}
+        )
+        model_policy = "conservative" if extreme_low_signal else "standard"
+        if log_fn is not None:
+            if model_policy == "conservative":
+                log_fn(
+                    "SPU {} switched to conservative policy: recommendation={}, "
+                    "validation_non_zero_points={}, validation_total_sales={:.2f}, "
+                    "zero_ratio={:.2f}, recent_to_prior_ratio={:.2f}.".format(
+                        spu,
+                        recommendation,
+                        validation_non_zero_points,
+                        validation_total_sales,
+                        zero_ratio,
+                        recent_to_prior_ratio,
+                    )
                 )
-            )
+            elif low_signal_window:
+                log_fn(
+                    "SPU {} stays in standard policy with low-signal guard: recommendation={}, "
+                    "validation_non_zero_points={}, validation_total_sales={:.2f}, "
+                    "zero_ratio={:.2f}, recent_to_prior_ratio={:.2f}.".format(
+                        spu,
+                        recommendation,
+                        validation_non_zero_points,
+                        validation_total_sales,
+                        zero_ratio,
+                        recent_to_prior_ratio,
+                    )
+                )
         future_dates = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
 
         if verbose:
