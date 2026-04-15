@@ -107,7 +107,14 @@ def _check_prophet_runtime():
         model.predict(test_df.tail(2))
         return True, "ok"
     except Exception as exc:
-        return False, str(exc)
+        # Some runtime environments report transient/backend-attribute errors
+        # in preflight but still work in real per-SPU execution. Treat these
+        # as soft-check failures and allow runtime attempts.
+        msg = str(exc)
+        soft_markers = ("stan_backend", "cmdstan", "pystan")
+        if any(marker in msg.lower() for marker in soft_markers):
+            return True, f"soft_check:{msg}"
+        return False, msg
 
 
 def clean_series(series):
@@ -824,6 +831,8 @@ def run_all_models(
         if not prophet_ready:
             _emit_model_log(log_fn, f"Prophet: 跳过（运行环境不可用: {prophet_reason}）")
         else:
+            if str(prophet_reason).startswith("soft_check:"):
+                _emit_model_log(log_fn, f"Prophet: 软检查放行（{prophet_reason}），进入实际训练尝试")
             _emit_model_log(log_fn, "运行 Prophet...")
             prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
             if prophet_result:
