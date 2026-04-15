@@ -546,75 +546,306 @@ def optimize_dl_with_arima(train_data, test_data, dl_type, arima_model, train_ar
         best['error'] = str(e)
     return best
 
+def _identify_fusion_regime(full_series):
+    values = np.asarray(full_series.values if hasattr(full_series, "values") else full_series, dtype=float).flatten()
+    if len(values) == 0:
+        return {
+            'regime': 'normal', 'is_low_signal': False, 'is_high_volatility': False,
+            'zero_ratio': 0.0, 'demand_density': 1.0, 'hist_cv': 0.0,
+            'recent_mean': 0.0, 'recent_median': 0.0, 'recent_p90': 0.0
+        }
+
+    recent = np.maximum(values[-min(26, len(values)):], 0)
+    recent_mean = float(np.mean(recent))
+    recent_median = float(np.median(recent))
+    recent_p90 = float(np.percentile(recent, 90))
+    zero_ratio = float(np.mean(recent <= 0))
+    demand_density = float(np.mean(recent > 0))
+    hist_cv = float(np.std(recent) / (recent_mean + 1e-6)) if recent_mean > 0 else 0.0
+    p95 = float(np.percentile(recent, 95))
+    p50 = max(float(np.percentile(recent, 50)), 1e-6)
+    spike_ratio = p95 / p50
+
+    is_low_signal = (zero_ratio >= 0.55) or (demand_density <= 0.45) or (recent_mean <= 1.0 and recent_median <= 1.0)
+    is_high_volatility = (hist_cv >= 1.25) or (spike_ratio >= 4.0)
+    if is_low_signal and is_high_volatility:
+        regime = 'mixed'
+    elif is_low_signal:
+        regime = 'low_signal'
+    elif is_high_volatility:
+        regime = 'high_volatility'
+    else:
+        regime = 'normal'
+
+    return {
+        'regime': regime,
+        'is_low_signal': is_low_signal,
+        'is_high_volatility': is_high_volatility,
+        'zero_ratio': zero_ratio,
+        'demand_density': demand_density,
+        'hist_cv': hist_cv,
+        'recent_mean': recent_mean,
+        'recent_median': recent_median,
+        'recent_p90': recent_p90
+    }
+
+
+def _compute_fusion_confidence(pred_matrix, wmapes, regime_info):
+    center = np.mean(pred_matrix, axis=1)
+    disagreement = np.mean(np.std(pred_matrix, axis=1) / (np.abs(center) + 1e-6))
+    consensus = float(np.clip(1.0 - disagreement, 0.0, 1.0))
+
+    wmape_best = float(np.min(wmapes))
+    wmape_span = float(np.max(wmapes) - np.min(wmapes)) if len(wmapes) > 1 else 0.0
+    quality = float(np.clip(1.0 - wmape_best, 0.0, 1.0))
+    stability = float(np.clip(1.0 - wmape_span, 0.0, 1.0))
+
+    confidence = 0.45 * consensus + 0.35 * quality + 0.20 * stability
+    if regime_info['is_low_signal']:
+        confidence -= 0.08
+    if regime_info['is_high_volatility']:
+        confidence -= 0.05
+    return float(np.clip(confidence, 0.12, 0.95))
+
+
+def _tail_penalized_wmape(y_true, y_pred, regime_info, fusion_confidence):
+    raw_wmape = calculate_wmape(y_true, y_pred)
+    y_true = np.asarray(y_true, dtype=float).flatten()
+    y_pred = np.asarray(y_pred, dtype=float).flatten()
+
+    denom = np.maximum(np.abs(y_true), 1.0)
+    ape = np.abs(y_true - y_pred) / denom
+    tail_85 = float(np.percentile(ape, 85))
+    tail_95 = float(np.percentile(ape, 95))
+
+    overshoot_ratio = float(np.sum(np.maximum(y_pred - y_true, 0)) / (np.sum(np.abs(y_true)) + 1e-6))
+    tail_penalty = max(0.0, tail_85 - 0.45) * 0.22 + max(0.0, tail_95 - 0.75) * 0.12
+    if regime_info['is_low_signal']:
+        tail_penalty += max(0.0, overshoot_ratio - 0.25) * 0.18
+    if regime_info['is_high_volatility']:
+        pred_mean = float(np.mean(y_pred))
+        pred_cv = float(np.std(y_pred) / (pred_mean + 1e-6)) if pred_mean > 0 else 0.0
+        hist_cv = max(float(regime_info.get('hist_cv', 0.0)), 0.01)
+        if pred_cv > hist_cv * 1.8:
+            tail_penalty += min(0.22, (pred_cv / hist_cv - 1.8) * 0.06)
+
+    confidence_penalty = (1.0 - fusion_confidence) * 0.08
+    effective_wmape = raw_wmape * (1.0 + tail_penalty + confidence_penalty)
+    meta = {
+        'tail_ape_p85': tail_85,
+        'tail_ape_p95': tail_95,
+        'overshoot_ratio': overshoot_ratio,
+        'tail_penalty': tail_penalty,
+        'confidence_penalty': confidence_penalty
+    }
+    return float(raw_wmape), float(effective_wmape), meta
+
+
+def _weighted_median_forecast(pred_matrix, weights):
+    matrix = np.asarray(pred_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[1] == 0:
+        return np.array([])
+    weights = np.asarray(weights, dtype=float).flatten()
+    if len(weights) != matrix.shape[1]:
+        weights = np.ones(matrix.shape[1], dtype=float)
+    weights = np.maximum(weights, 0.0)
+    if np.sum(weights) < 1e-6:
+        weights = np.ones(matrix.shape[1], dtype=float) / matrix.shape[1]
+    else:
+        weights = weights / np.sum(weights)
+
+    out = np.zeros(matrix.shape[0], dtype=float)
+    for i in range(matrix.shape[0]):
+        order = np.argsort(matrix[i])
+        values_sorted = matrix[i, order]
+        w_sorted = weights[order]
+        cdf = np.cumsum(w_sorted)
+        idx = min(np.searchsorted(cdf, 0.5, side='left'), len(values_sorted) - 1)
+        out[i] = values_sorted[idx]
+    return out
+
+
+def _apply_fusion_guardrail(forecast, full_data, regime, confidence, fallback_value):
+    res = np.asarray(forecast, dtype=float).flatten().copy()
+    hist = np.asarray(full_data.values if hasattr(full_data, "values") else full_data, dtype=float).flatten()
+    if len(res) == 0 or len(hist) == 0:
+        return np.maximum(res, 0)
+
+    recent = np.maximum(hist[-min(26, len(hist)):], 0)
+    recent_mean = float(np.mean(recent))
+    recent_median = float(np.median(recent))
+    recent_p90 = float(np.percentile(recent, 90))
+    hist_cv = float(np.std(recent) / (recent_mean + 1e-6)) if recent_mean > 0 else 0.0
+    base_anchor = max(recent_median, recent_mean, float(fallback_value), 0.0)
+
+    if regime in ('low_signal', 'mixed'):
+        cap = max(recent_p90 * 1.8, base_anchor * 1.6 + 1.0)
+        res = np.minimum(res, cap)
+        shrink = min(0.55, 0.25 + (1.0 - confidence) * 0.45)
+        anchor = np.full_like(res, max(recent_median, base_anchor * 0.8))
+        res = (1.0 - shrink) * res + shrink * anchor
+
+    if regime in ('high_volatility', 'mixed'):
+        target_cv = max(hist_cv * 0.9, 0.10)
+        pred_mean = float(np.mean(res))
+        pred_cv = float(np.std(res) / (pred_mean + 1e-6)) if pred_mean > 0 else 0.0
+        if pred_cv > target_cv * 1.7 and pred_cv > 0:
+            scale = (target_cv * 1.7) / pred_cv
+            center = pred_mean
+            res = center + (res - center) * scale
+
+    if confidence < 0.25:
+        conservative = np.full_like(res, base_anchor)
+        res = 0.6 * res + 0.4 * conservative
+
+    return np.maximum(res, 0)
+
+
 def optimize_ensemble(base_results, test_data, mode='full', train_data=None):
     valid = [r for r in base_results if r['forecast'] is not None and r['wmape'] < float('inf')]
-    if len(valid) < 2: return []
-    
+    if len(valid) < 2:
+        return []
+
     test_values = test_data.values.flatten()
     preds = np.column_stack([r['forecast'] for r in valid])
-    names, wmapes = [r['name'] for r in valid], np.array([r['wmape'] for r in valid])
-    
+    names, wmapes = [r['name'] for r in valid], np.array([r['wmape'] for r in valid], dtype=float)
+
     full_series = pd.concat([train_data, test_data]) if train_data is not None else test_data
     s_str, _, d_per = detect_seasonality_strength(full_series)
     s_pat = extract_seasonal_pattern(full_series, d_per)
     t_dir, t_str, t_slope = detect_trend_strength(full_series)
-    t_scores = np.array([calculate_trend_consistency(preds[:, i], t_dir, t_slope) for i in range(len(valid))])
-    
+    t_scores = np.array([calculate_trend_consistency(preds[:, i], t_dir, t_slope) for i in range(len(valid))], dtype=float)
+
     seas_mask = np.array([any(x in n for x in ['Prophet', 'SARIMA']) for n in names])
-    
+    regime_info = _identify_fusion_regime(full_series)
+    base_confidence = _compute_fusion_confidence(preds, wmapes, regime_info)
+
     methods = SearchConfig.get(mode).get('ensemble', {}).get('methods', ['weighted'])
     results = []
-    
+
+    def append_candidate(name, forecast, params, confidence_boost=0.0):
+        forecast = np.maximum(np.asarray(forecast, dtype=float).flatten(), 0)
+        if len(forecast) != len(test_values):
+            return
+        median_line = np.median(preds, axis=1)
+        deviation = np.mean(np.abs(forecast - median_line) / (np.abs(median_line) + 1e-6))
+        candidate_consensus = float(np.clip(1.0 - deviation, 0.0, 1.0))
+        confidence = float(np.clip(0.65 * base_confidence + 0.35 * candidate_consensus + confidence_boost, 0.08, 0.97))
+        raw_wmape, effective_wmape, tail_meta = _tail_penalized_wmape(test_values, forecast, regime_info, confidence)
+
+        candidate_params = {
+            **params,
+            'fusion_regime': regime_info['regime'],
+            'fusion_confidence': round(confidence, 4),
+            'raw_wmape': round(raw_wmape, 6),
+            'effective_wmape': round(effective_wmape, 6),
+            'tail_penalty': round(tail_meta['tail_penalty'], 6),
+            'confidence_penalty': round(tail_meta['confidence_penalty'], 6),
+            'tail_ape_p85': round(tail_meta['tail_ape_p85'], 6),
+            'tail_ape_p95': round(tail_meta['tail_ape_p95'], 6),
+            'overshoot_ratio': round(tail_meta['overshoot_ratio'], 6),
+            'regime_zero_ratio': round(regime_info['zero_ratio'], 6),
+            'regime_demand_density': round(regime_info['demand_density'], 6),
+            'regime_hist_cv': round(regime_info['hist_cv'], 6),
+            'regime_recent_mean': round(regime_info['recent_mean'], 6),
+            'regime_recent_p90': round(regime_info['recent_p90'], 6)
+        }
+        results.append({'name': name, 'wmape': effective_wmape, 'forecast': forecast, 'params': candidate_params})
+
     if 'simple' in methods:
         p = np.mean(preds, axis=1)
-        results.append({'name': 'Ensemble_Avg', 'wmape': calculate_wmape(test_values, p), 'forecast': p, 'params': {'method': 'simple', 'base_models': names}})
-        
+        append_candidate('Ensemble_Avg', p, {'method': 'simple', 'base_models': names}, confidence_boost=-0.02)
+
     if 'weighted' in methods:
-        w_wmape = 1 / (wmapes + 1e-6); w_wmape /= w_wmape.sum()
+        w_wmape = 1 / (wmapes + 1e-6)
+        w_wmape /= w_wmape.sum()
         p = np.average(preds, axis=1, weights=w_wmape)
-        results.append({'name': 'Ensemble_Wgt', 'wmape': calculate_wmape(test_values, p), 'forecast': p, 'params': {'method': 'wmape_weighted', 'base_models': names, 'weights': list(w_wmape), 'wmape_weights': list(w_wmape)}})
-        
+        append_candidate(
+            'Ensemble_Wgt', p,
+            {'method': 'wmape_weighted', 'base_models': names, 'weights': list(w_wmape), 'wmape_weights': list(w_wmape)},
+            confidence_boost=0.02
+        )
+
         if s_str > 0.2 and seas_mask.any():
-            w_seas = w_wmape.copy(); w_seas[seas_mask] *= (1 + s_str * 1.5); w_seas /= w_seas.sum()
+            w_seas = w_wmape.copy()
+            w_seas[seas_mask] *= (1 + s_str * 1.5)
+            w_seas /= w_seas.sum()
             p_seas = np.average(preds, axis=1, weights=w_seas)
-            results.append({'name': 'Ensemble_Seas', 'wmape': calculate_wmape(test_values, p_seas), 'forecast': p_seas, 'params': {'method': 'seasonal_weighted', 'base_models': names, 'weights': list(w_seas), 'wmape_weights': list(w_wmape), 'seasonal_strength': s_str}})
-            
+            append_candidate(
+                'Ensemble_Seas', p_seas,
+                {'method': 'seasonal_weighted', 'base_models': names, 'weights': list(w_seas), 'wmape_weights': list(w_wmape), 'seasonal_strength': s_str}
+            )
+
         if t_str > 0.2 and t_dir != 'flat':
-            w_trend = w_wmape * (1 + t_str * 2 * t_scores); w_trend /= w_trend.sum()
+            w_trend = w_wmape * (1 + t_str * 2 * t_scores)
+            w_trend /= w_trend.sum()
             p_trend = np.average(preds, axis=1, weights=w_trend)
-            results.append({'name': 'Ensemble_Trend', 'wmape': calculate_wmape(test_values, p_trend), 'forecast': p_trend, 'params': {'method': 'trend_weighted', 'base_models': names, 'weights': list(w_trend), 'trend_direction': t_dir, 'trend_strength': t_str}})
-            
+            append_candidate(
+                'Ensemble_Trend', p_trend,
+                {'method': 'trend_weighted', 'base_models': names, 'weights': list(w_trend), 'trend_direction': t_dir, 'trend_strength': t_str}
+            )
+
         if t_str > 0.15 or s_str > 0.15:
-            s_scores = np.ones(len(names))*0.5; s_scores[seas_mask] = 1.0 + s_str; s_scores /= s_scores.sum()
-            t_scores_norm = np.maximum(t_scores, 0.2); t_scores_norm /= t_scores_norm.sum()
-            a, b, g = 0.5, min(s_str*0.4, 0.25), min(t_str*0.4, 0.25); tot = a+b+g; a,b,g = a/tot, b/tot, g/tot
-            w_comb = a*w_wmape + b*s_scores + g*t_scores_norm; w_comb = np.maximum(w_comb, 0); w_comb /= w_comb.sum()
+            s_scores = np.ones(len(names)) * 0.5
+            s_scores[seas_mask] = 1.0 + s_str
+            s_scores /= s_scores.sum()
+            t_scores_norm = np.maximum(t_scores, 0.2)
+            t_scores_norm /= t_scores_norm.sum()
+            a, b, g = 0.5, min(s_str * 0.4, 0.25), min(t_str * 0.4, 0.25)
+            total = a + b + g
+            a, b, g = a / total, b / total, g / total
+            w_comb = a * w_wmape + b * s_scores + g * t_scores_norm
+            w_comb = np.maximum(w_comb, 0)
+            w_comb /= w_comb.sum()
             p_comb = np.average(preds, axis=1, weights=w_comb)
-            results.append({'name': 'Ensemble_TS', 'wmape': calculate_wmape(test_values, p_comb), 'forecast': p_comb, 'params': {'method': 'trend_seasonal_combined', 'base_models': names, 'weights': list(w_comb), 'wmape_weights': list(w_wmape), 'trend_direction': t_dir, 'trend_strength': t_str, 'seasonal_strength': s_str, 'trend_consistency_scores': list(t_scores)}})
+            append_candidate(
+                'Ensemble_TS', p_comb,
+                {'method': 'trend_seasonal_combined', 'base_models': names, 'weights': list(w_comb), 'wmape_weights': list(w_wmape), 'trend_direction': t_dir, 'trend_strength': t_str, 'seasonal_strength': s_str, 'trend_consistency_scores': list(t_scores)}
+            )
+
+        if regime_info['regime'] != 'normal':
+            p_robust = _weighted_median_forecast(preds, w_wmape)
+            if regime_info['is_low_signal']:
+                robust_cap = max(regime_info['recent_p90'] * 1.6, regime_info['recent_mean'] * 1.5 + 1.0)
+                p_robust = np.minimum(p_robust, robust_cap)
+            append_candidate(
+                'Ensemble_Robust', p_robust,
+                {'method': 'weighted_median_robust', 'base_models': names, 'weights': list(w_wmape), 'wmape_weights': list(w_wmape)},
+                confidence_boost=0.05
+            )
 
     if 'stacking' in methods:
         try:
-            meta = Ridge(alpha=1.0, fit_intercept=True); meta.fit(preds, test_values)
+            meta = Ridge(alpha=1.0, fit_intercept=True)
+            meta.fit(preds, test_values)
             p_stack = meta.predict(preds)
-            w_wmape = 1 / (wmapes + 1e-6); w_wmape /= w_wmape.sum()
-            
+            w_wmape = 1 / (wmapes + 1e-6)
+            w_wmape /= w_wmape.sum()
+
             if (t_str > 0.25 and t_dir != 'flat') and (detect_trend_strength(pd.Series(p_stack))[0] != t_dir or np.any(meta.coef_ < -0.1)):
                 best_t_idx = np.argmax(t_scores)
                 if detect_trend_strength(pd.Series(preds[:, best_t_idx]))[0] == t_dir:
-                    cw = min(t_str * 0.5, 0.35)
-                    p_stack = (1 - cw) * p_stack + cw * preds[:, best_t_idx]
-                else: p_stack = np.average(preds, axis=1, weights=w_wmape * (1 + t_scores) / (w_wmape * (1 + t_scores)).sum())
-            
+                    corr_weight = min(t_str * 0.5, 0.35)
+                    p_stack = (1 - corr_weight) * p_stack + corr_weight * preds[:, best_t_idx]
+                else:
+                    w_t = w_wmape * (1 + t_scores)
+                    p_stack = np.average(preds, axis=1, weights=w_t / w_t.sum())
+
             if s_str > 0.25 and len(test_values) >= 4 and train_data is not None:
                 t_idx = get_seasonal_indices(test_data.index, train_data.index[-1], d_per)
-                s_corr = np.array([(s_pat[idx%len(s_pat)]-1.0)*np.mean(test_values)*s_str*0.1 if idx<len(s_pat) else 0 for idx in t_idx])
+                s_corr = np.array([(s_pat[idx % len(s_pat)] - 1.0) * np.mean(test_values) * s_str * 0.1 if idx < len(s_pat) else 0 for idx in t_idx])
                 p_corr = p_stack + s_corr
-                if calculate_wmape(test_values, p_corr) < calculate_wmape(test_values, p_stack): p_stack = p_corr
-            
+                if calculate_wmape(test_values, p_corr) < calculate_wmape(test_values, p_stack):
+                    p_stack = p_corr
+
             p_stack = np.maximum(p_stack, 0)
-            results.append({'name': 'Ensemble_Stack', 'wmape': calculate_wmape(test_values, p_stack), 'forecast': p_stack, 'params': {'method': 'stacking_enhanced', 'base_models': names, 'weights': list(meta.coef_), 'wmape_weights': list(w_wmape), 'trend_direction': t_dir, 'trend_strength': t_str, 'seasonal_strength': s_str, 'detected_period': d_per, 'trend_consistency_scores': list(t_scores), 'seasonal_pattern': list(s_pat[:min(12, len(s_pat))])}})
-        except: pass
-        
+            append_candidate(
+                'Ensemble_Stack', p_stack,
+                {'method': 'stacking_enhanced', 'base_models': names, 'weights': list(meta.coef_), 'wmape_weights': list(w_wmape), 'trend_direction': t_dir, 'trend_strength': t_str, 'seasonal_strength': s_str, 'detected_period': d_per, 'trend_consistency_scores': list(t_scores), 'seasonal_pattern': list(s_pat[:min(12, len(s_pat))])}
+            )
+        except:
+            pass
+
     return results
 
 def predict_future(full_data, winner_info, n_future=16, full_exog=None, future_exog=None, base_results=None):
@@ -626,6 +857,8 @@ def predict_future(full_data, winner_info, n_future=16, full_exog=None, future_e
         w_wmape = params.get('wmape_weights', weights)
         t_dir, t_str = params.get('trend_direction', 'flat'), params.get('trend_strength', 0)
         s_str, d_per = params.get('seasonal_strength', 0), params.get('detected_period', 52)
+        fusion_regime = params.get('fusion_regime', 'normal')
+        fusion_confidence = float(params.get('fusion_confidence', 0.5))
         
         preds, valid_w = [], []
         for i, bn in enumerate(bns):
@@ -692,6 +925,14 @@ def predict_future(full_data, winner_info, n_future=16, full_exog=None, future_e
             stretch_ratio = min((hist_cv * 0.6) / pred_cv, 3.0) 
             res_center = np.mean(res)
             res = res_center + (res - res_center) * stretch_ratio
+
+        if fusion_confidence < 0.28 and len(preds) >= 2:
+            robust_future = _weighted_median_forecast(np.array(preds).T, valid_w)
+            if len(robust_future) == len(res):
+                blend = min(0.5, 0.3 + (0.28 - fusion_confidence) * 0.8)
+                res = (1 - blend) * res + blend * robust_future
+
+        res = _apply_fusion_guardrail(res, full_data, fusion_regime, fusion_confidence, fb)
             
         # =========================================================================
             
