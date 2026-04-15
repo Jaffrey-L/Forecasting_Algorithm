@@ -2,6 +2,7 @@
 import numpy as np
 import pmdarima as pm
 import json
+import sys
 try:
     from prophet import Prophet
 except Exception:  # pragma: no cover - runtime fallback for envs without prophet
@@ -488,7 +489,7 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
     if Prophet is None:
         _PROPHET_LAST_FAILURE_REASON = "prophet_not_installed"
         if verbose:
-            print("Prophet skipped: package not installed")
+            _emit_model_log(None, "Prophet skipped: package not installed")
         return None
     try:
         regime = _infer_model_regime(train, screening)
@@ -496,9 +497,9 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
 
         if df_train.empty:
             if verbose:
-                print("Prophet 澶辫触: 璁粌鏁版嵁涓虹┖")
+                _emit_model_log(None, "Prophet failed: empty training data")
             else:
-                print("Prophet 澶辫触: 璁粌鏁版嵁涓虹┖")
+                _emit_model_log(None, "Prophet failed: empty training data")
             return None
 
         if train_exog is not None:
@@ -554,7 +555,7 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
     except Exception as e:
         _PROPHET_LAST_FAILURE_REASON = str(e)
         if verbose:
-            print(f"Prophet 澶辫触: {e}")
+            _emit_model_log(None, f"Prophet failed: {e}")
             import traceback
             traceback.print_exc()
         return None
@@ -565,16 +566,17 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
         regime = _infer_model_regime(train, screening)
         fe = FeatureEngineer()
         X_train, y_train = fe.make_features(pd.DataFrame(train), train_exog)
-        
-        # 妫€鏌_train鎴杫_train鏄惁涓虹┖
+        fallback_without_exog = False
         if X_train.empty or y_train.empty:
-            if verbose:
-                print("XGBoost 澶辫触: 璁粌鏁版嵁涓虹┖")
-            else:
-                print("XGBoost 澶辫触: 璁粌鏁版嵁涓虹┖")
-            return None
-            
-        X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
+            # Fallback: exogenous features may collapse rows after lag/rolling.
+            # Retry with pure history features to keep tree model in competition.
+            X_train, y_train = fe.make_features(pd.DataFrame(train), None)
+            fallback_without_exog = True
+            if X_train.empty or y_train.empty:
+                _emit_model_log(None, "XGBoost failed: empty training data")
+                return None
+
+        X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), None if fallback_without_exog else test_exog)
         train_cv = float(np.std(train.values) / max(np.mean(np.abs(train.values)), 1.0))
         history = int(regime["history_weeks"])
         params = {
@@ -595,6 +597,21 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
         model = XGBRegressor(**params)
         eval_set = None
         fit_kwargs = {"verbose": False}
+        def _fit_xgb(x_fit, y_fit, kwargs):
+            try:
+                model.fit(x_fit, y_fit, **kwargs)
+                return
+            except TypeError:
+                pass
+            # Backward compatibility for older xgboost sklearn wrappers.
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("early_stopping_rounds", None)
+            try:
+                model.fit(x_fit, y_fit, **retry_kwargs)
+                return
+            except TypeError:
+                pass
+            model.fit(x_fit, y_fit)
         if len(X_train) >= 20:
             split = max(4, int(len(X_train) * 0.2))
             if len(X_train) - split >= 12:
@@ -602,11 +619,11 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
                 y_fit, y_valid = y_train.iloc[:-split], y_train.iloc[-split:]
                 eval_set = [(X_valid, y_valid)]
                 fit_kwargs.update({"eval_set": eval_set, "early_stopping_rounds": 25})
-                model.fit(X_fit, y_fit, **fit_kwargs)
+                _fit_xgb(X_fit, y_fit, fit_kwargs)
             else:
-                model.fit(X_train, y_train, **fit_kwargs)
+                _fit_xgb(X_train, y_train, fit_kwargs)
         else:
-            model.fit(X_train, y_train, **fit_kwargs)
+            _fit_xgb(X_train, y_train, fit_kwargs)
         y_pred = model.predict(X_test)
         y_pred = np.maximum(y_pred, 0)
         if regime["zero_heavy"]:
@@ -624,11 +641,11 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
         }
     except Exception as e:
         if verbose:
-            print(f"XGBoost 澶辫触: {e}")
+            _emit_model_log(None, f"XGBoost failed: {e}")
             import traceback
             traceback.print_exc()
         else:
-            print(f"XGBoost 澶辫触: {e}")
+            _emit_model_log(None, f"XGBoost failed: {e}")
         return None
 
 
@@ -637,16 +654,15 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
         regime = _infer_model_regime(train, screening)
         fe = FeatureEngineer()
         X_train, y_train = fe.make_features(pd.DataFrame(train), train_exog)
-        
-        # 妫€鏌_train鎴杫_train鏄惁涓虹┖
+        fallback_without_exog = False
         if X_train.empty or y_train.empty:
-            if verbose:
-                print("LightGBM 澶辫触: 璁粌鏁版嵁涓虹┖")
-            else:
-                print("LightGBM 澶辫触: 璁粌鏁版嵁涓虹┖")
-            return None
-            
-        X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), test_exog)
+            X_train, y_train = fe.make_features(pd.DataFrame(train), None)
+            fallback_without_exog = True
+            if X_train.empty or y_train.empty:
+                _emit_model_log(None, "LightGBM failed: empty training data")
+                return None
+
+        X_test, _ = fe.make_features_for_prediction(pd.DataFrame(test), None if fallback_without_exog else test_exog)
         train_cv = float(np.std(train.values) / max(np.mean(np.abs(train.values)), 1.0))
         history = int(regime["history_weeks"])
         params = {
@@ -666,17 +682,31 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
             params.update({"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 16, "subsample": 0.8})
         model = LGBMRegressor(**params)
         fit_kwargs = {"verbose": -1}
+        def _fit_lgb(x_fit, y_fit, kwargs):
+            try:
+                model.fit(x_fit, y_fit, **kwargs)
+                return
+            except TypeError:
+                pass
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("verbose", None)
+            try:
+                model.fit(x_fit, y_fit, **retry_kwargs)
+                return
+            except TypeError:
+                pass
+            model.fit(x_fit, y_fit)
         if len(X_train) >= 20:
             split = max(4, int(len(X_train) * 0.2))
             if len(X_train) - split >= 12:
                 X_fit, X_valid = X_train.iloc[:-split], X_train.iloc[-split:]
                 y_fit, y_valid = y_train.iloc[:-split], y_train.iloc[-split:]
                 fit_kwargs.update({"eval_set": [(X_valid, y_valid)]})
-                model.fit(X_fit, y_fit, **fit_kwargs)
+                _fit_lgb(X_fit, y_fit, fit_kwargs)
             else:
-                model.fit(X_train, y_train, **fit_kwargs)
+                _fit_lgb(X_train, y_train, fit_kwargs)
         else:
-            model.fit(X_train, y_train, **fit_kwargs)
+            _fit_lgb(X_train, y_train, fit_kwargs)
         y_pred = model.predict(X_test)
         y_pred = np.maximum(y_pred, 0)
         if regime["zero_heavy"]:
@@ -694,11 +724,11 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
         }
     except Exception as e:
         if verbose:
-            print(f"LightGBM 澶辫触: {e}")
+            _emit_model_log(None, f"LightGBM failed: {e}")
             import traceback
             traceback.print_exc()
         else:
-            print(f"LightGBM 澶辫触: {e}")
+            _emit_model_log(None, f"LightGBM failed: {e}")
         return None
 
 
@@ -747,17 +777,23 @@ def run_auto_arima(train, test, train_exog=None, test_exog=None, verbose=False, 
         }
     except Exception as e:
         if verbose:
-            print(f"AutoARIMA 澶辫触: {e}")
+            _emit_model_log(None, f"AutoARIMA failed: {e}")
         else:
-            print(f"AutoARIMA 澶辫触: {e}")
+            _emit_model_log(None, f"AutoARIMA failed: {e}")
         return None
 
 
 def _emit_model_log(log_fn, message):
+    try:
+        safe_message = str(message)
+    except Exception:
+        safe_message = repr(message)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe_message = safe_message.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
     if log_fn is not None:
-        log_fn(message)
+        log_fn(safe_message)
     else:
-        print(message)
+        print(safe_message)
 
 def run_seasonal_naive(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
     try:
