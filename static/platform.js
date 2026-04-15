@@ -179,7 +179,13 @@ function setRunStatus(run) {
 
 function updateRunSummary(run) {
   const summary = run?.summary || {};
-  const failedSpus = summary.failed_spus ?? Math.max((run?.total_count || 0) - (run?.success_count || 0), 0);
+  // During running, unprocessed SPUs must not be treated as failed.
+  // Failure count should be based on processed vs success, and final summary when available.
+  const active = isActiveRunStatus(run?.status);
+  const processedFailures = Math.max((run?.processed_count || 0) - (run?.success_count || 0), 0);
+  const failedSpus = active
+    ? processedFailures
+    : (summary.failed_spus ?? processedFailures);
   const policySummary = (summary.policy_standard_spus != null || summary.policy_conservative_spus != null)
     ? `${summary.policy_standard_spus || 0}标准 / ${summary.policy_conservative_spus || 0}保守`
     : "-";
