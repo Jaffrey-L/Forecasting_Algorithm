@@ -18,6 +18,11 @@ from src.forecasting.models import *
 
 forecast_kernel = None
 MAX_WMAPE_CAP = 9.999
+_PROPHET_RUNTIME_FAILURES = 0
+_PROPHET_LAST_FAILURE_REASON = ""
+_PROPHET_RUNTIME_FAILURE_LIMIT = 5
+_PROPHET_CIRCUIT_OPEN_UNTIL = 0.0
+_PROPHET_CIRCUIT_COOLDOWN_SEC = 900
 
 
 def _series_to_float_series(series):
@@ -250,6 +255,8 @@ def _infer_fusion_regime(screening, train, test, conservative):
 
 def _allow_tree_models_in_conservative(screening, train, test):
     screening = screening or {}
+    recommendation = str(screening.get("recommendation", "")).lower()
+    is_anomalous = bool(screening.get("is_anomalous", False))
     zero_ratio = float(screening.get("zero_ratio", 1.0))
     recent_to_prior_ratio = float(screening.get("recent_to_prior_ratio", 0.0))
     validation_non_zero = int(np.count_nonzero(np.asarray(test, dtype=float) > 0))
@@ -257,6 +264,9 @@ def _allow_tree_models_in_conservative(screening, train, test):
     # Keep conservative stance, but allow trees to participate when signal
     # is not extremely sparse/collapsed.
     return (
+        recommendation != "zero_override"
+        and not is_anomalous
+        and
         history_weeks >= 104
         and validation_non_zero >= 5
         and zero_ratio <= 0.70
@@ -352,7 +362,9 @@ def _build_horizon_weight_matrix(component_names, base_weights, n_steps, regime)
 
 
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
+    global _PROPHET_LAST_FAILURE_REASON
     if Prophet is None:
+        _PROPHET_LAST_FAILURE_REASON = "prophet_not_installed"
         if verbose:
             print("Prophet skipped: package not installed")
         return None
@@ -418,6 +430,7 @@ def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, scr
             'params': model.params if hasattr(model, 'params') else {}
         }
     except Exception as e:
+        _PROPHET_LAST_FAILURE_REASON = str(e)
         if verbose:
             print(f"Prophet 澶辫触: {e}")
             import traceback
@@ -827,21 +840,49 @@ def run_all_models(
         _emit_model_log(log_fn, f"跳过 Prophet（conservative 策略，{conservative_reason}）")
     else:
         enabled_base_models.append("Prophet")
-        prophet_ready, prophet_reason = _check_prophet_runtime()
-        if not prophet_ready:
-            _emit_model_log(log_fn, f"Prophet: 跳过（运行环境不可用: {prophet_reason}）")
+        global _PROPHET_RUNTIME_FAILURES
+        global _PROPHET_LAST_FAILURE_REASON
+        global _PROPHET_CIRCUIT_OPEN_UNTIL
+        failure_limit = int(max(1, _PROPHET_RUNTIME_FAILURE_LIMIT))
+        now_ts = float(time.time())
+        if now_ts < _PROPHET_CIRCUIT_OPEN_UNTIL:
+            remaining = int(max(0, _PROPHET_CIRCUIT_OPEN_UNTIL - now_ts))
+            _emit_model_log(
+                log_fn,
+                f"Prophet: 熔断跳过（剩余冷却 {remaining}s，累计失败 {_PROPHET_RUNTIME_FAILURES} 次，阈值 {failure_limit}）"
+            )
         else:
-            if str(prophet_reason).startswith("soft_check:"):
-                _emit_model_log(log_fn, f"Prophet: 软检查放行（{prophet_reason}），进入实际训练尝试")
-            _emit_model_log(log_fn, "运行 Prophet...")
-            prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
-            if prophet_result:
-                prophet_result["stage"] = "base"
-                models.append(prophet_result)
-                base_models.append(prophet_result)
-                _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+            if _PROPHET_RUNTIME_FAILURES >= failure_limit:
+                _emit_model_log(
+                    log_fn,
+                    "Prophet: 熔断冷却结束，执行探测重试。"
+                )
+                _PROPHET_RUNTIME_FAILURES = max(0, failure_limit - 1)
+            prophet_ready, prophet_reason = _check_prophet_runtime()
+            if not prophet_ready:
+                _emit_model_log(log_fn, f"Prophet: 跳过（运行环境不可用: {prophet_reason}）")
             else:
-                _emit_model_log(log_fn, "Prophet: 失败")
+                if str(prophet_reason).startswith("soft_check:"):
+                    _emit_model_log(log_fn, f"Prophet: 软检查放行（{prophet_reason}），进入实际训练尝试")
+                _emit_model_log(log_fn, "运行 Prophet...")
+                _PROPHET_LAST_FAILURE_REASON = ""
+                prophet_result = run_prophet(train, test, train_exog, test_exog, verbose, screening=screening)
+                if prophet_result:
+                    _PROPHET_RUNTIME_FAILURES = 0
+                    _PROPHET_CIRCUIT_OPEN_UNTIL = 0.0
+                    prophet_result["stage"] = "base"
+                    models.append(prophet_result)
+                    base_models.append(prophet_result)
+                    _emit_model_log(log_fn, f"Prophet: WMAPE={prophet_result['wmape']:.2%}")
+                else:
+                    _PROPHET_RUNTIME_FAILURES += 1
+                    if _PROPHET_RUNTIME_FAILURES >= failure_limit:
+                        _PROPHET_CIRCUIT_OPEN_UNTIL = float(time.time()) + float(_PROPHET_CIRCUIT_COOLDOWN_SEC)
+                    failure_reason = _PROPHET_LAST_FAILURE_REASON or "unknown_error"
+                    _emit_model_log(
+                        log_fn,
+                        f"Prophet: 失败（reason={failure_reason}，consecutive_failures={_PROPHET_RUNTIME_FAILURES}）"
+                    )
 
     if conservative and not allow_trees_under_conservative:
         _emit_model_log(log_fn, f"跳过 XGBoost（严格 conservative，{conservative_reason}）")

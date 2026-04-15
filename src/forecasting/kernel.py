@@ -526,6 +526,14 @@ def process_single_spu(
         recommendation = str(screening.get("recommendation") or "standard").lower()
         zero_ratio = float(screening.get("zero_ratio", 1.0))
         recent_to_prior_ratio = float(screening.get("recent_to_prior_ratio", 0.0))
+        allow_standard_models = bool(screening.get("allow_standard_models", True))
+        is_anomalous = bool(screening.get("is_anomalous", False))
+        allow_standard_override = str(os.getenv("ALLOW_STANDARD_UNDER_CONSERVATIVE_HINT", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         # Two-tier gate:
         # - conservative: only for truly extreme low-signal / collapse scenarios
@@ -542,19 +550,38 @@ def process_single_spu(
             or validation_total_sales < 120
             or recommendation in {"conservative", "zero_override"}
         )
-        model_policy = "conservative" if extreme_low_signal else "standard"
+        baseline_conservative = (
+            recommendation in {"conservative", "zero_override"}
+            or (not allow_standard_models)
+            or is_anomalous
+        )
+        model_policy = (
+            "conservative"
+            if extreme_low_signal or (baseline_conservative and not allow_standard_override)
+            else "standard"
+        )
         if log_fn is not None:
             if model_policy == "conservative":
+                guardrail_reason = []
+                if recommendation in {"conservative", "zero_override"}:
+                    guardrail_reason.append(f"recommendation={recommendation}")
+                if not allow_standard_models:
+                    guardrail_reason.append("allow_standard_models=False")
+                if is_anomalous:
+                    guardrail_reason.append("is_anomalous=True")
+                if allow_standard_override and baseline_conservative and not extreme_low_signal:
+                    guardrail_reason.append("override=ALLOW_STANDARD_UNDER_CONSERVATIVE_HINT")
                 log_fn(
                     "SPU {} switched to conservative policy: recommendation={}, "
                     "validation_non_zero_points={}, validation_total_sales={:.2f}, "
-                    "zero_ratio={:.2f}, recent_to_prior_ratio={:.2f}.".format(
+                    "zero_ratio={:.2f}, recent_to_prior_ratio={:.2f}, guardrail={}.".format(
                         spu,
                         recommendation,
                         validation_non_zero_points,
                         validation_total_sales,
                         zero_ratio,
                         recent_to_prior_ratio,
+                        ",".join(guardrail_reason) if guardrail_reason else "none",
                     )
                 )
             elif low_signal_window:
@@ -568,6 +595,16 @@ def process_single_spu(
                         validation_total_sales,
                         zero_ratio,
                         recent_to_prior_ratio,
+                    )
+                )
+            if model_policy == "standard" and baseline_conservative and allow_standard_override and not extreme_low_signal:
+                log_fn(
+                    "SPU {} standard override active via ALLOW_STANDARD_UNDER_CONSERVATIVE_HINT: "
+                    "recommendation={}, allow_standard_models={}, is_anomalous={}.".format(
+                        spu,
+                        recommendation,
+                        allow_standard_models,
+                        is_anomalous,
                     )
                 )
         future_dates = pd.date_range(series_clean.index[-1], periods=17, freq="W")[1:]
