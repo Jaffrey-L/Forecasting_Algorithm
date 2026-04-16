@@ -154,6 +154,19 @@ def _standard_model_score(model: dict, test_series: pd.Series) -> float:
     wmape = float(model.get("wmape", float("inf")))
     if not np.isfinite(wmape):
         wmape = 9.999
+    diagnostics = model.get("diagnostics") or {}
+    quality_score = float(model.get("quality_score", wmape))
+    if not np.isfinite(quality_score):
+        quality_score = wmape
+    p95_ape = float(diagnostics.get("p95_ape", 0.0))
+    over_forecast_ratio = float(diagnostics.get("over_forecast_ratio", 0.0))
+    if not np.isfinite(p95_ape):
+        p95_ape = 0.0
+    if not np.isfinite(over_forecast_ratio):
+        over_forecast_ratio = 0.0
+    soft_wmape = float(calculate_wmape(actual, preds, min_non_zero_points=1))
+    if not np.isfinite(soft_wmape):
+        soft_wmape = 9.999
 
     pred_mean = float(np.mean(preds)) if n > 0 else 0.0
     actual_mean = float(np.mean(actual)) if n > 0 else 0.0
@@ -165,8 +178,20 @@ def _standard_model_score(model: dict, test_series: pd.Series) -> float:
     actual_zero_ratio = float(np.mean(actual == 0.0))
     zero_mismatch = abs(pred_zero_ratio - actual_zero_ratio)
 
-    # Lighter than conservative score, used only for close-call decisions.
-    return wmape + 0.12 * over_bias + 0.08 * pred_jump + 0.06 * zero_mismatch
+    # In capped-WMAPE scenarios, include soft WMAPE and model diagnostics to
+    # improve separation among "same WMAPE" candidates.
+    cap_penalty = 0.20 if wmape >= 9.0 else 0.0
+    return (
+        0.64 * wmape
+        + 0.16 * soft_wmape
+        + 0.10 * quality_score
+        + 0.04 * p95_ape
+        + 0.03 * over_forecast_ratio
+        + 0.02 * over_bias
+        + 0.01 * pred_jump
+        + 0.01 * zero_mismatch
+        + cap_penalty
+    )
 
 
 def _low_signal_model_score(model: dict, test_series: pd.Series, history_series: pd.Series) -> float:

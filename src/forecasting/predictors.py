@@ -591,6 +591,7 @@ def run_xgboost(train, test, train_exog=None, test_exog=None, verbose=False, scr
             "objective": "reg:squarederror",
             "random_state": 42,
             "n_jobs": -1,
+            "verbosity": 0,
         }
         if regime["zero_heavy"]:
             params.update({"max_depth": 3, "min_child_weight": 7, "learning_rate": 0.03, "subsample": 0.8})
@@ -677,6 +678,7 @@ def run_lightgbm(train, test, train_exog=None, test_exog=None, verbose=False, sc
             "reg_lambda": 1.0,
             "random_state": 42,
             "n_jobs": -1,
+            "verbosity": -1,
         }
         if regime["zero_heavy"]:
             params.update({"num_leaves": 15, "learning_rate": 0.03, "min_child_samples": 16, "subsample": 0.8})
