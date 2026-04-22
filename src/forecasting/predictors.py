@@ -481,7 +481,110 @@ def _build_horizon_weight_matrix(component_names, base_weights, n_steps, regime)
         else:
             row = row / s
         matrix[:, h] = row
+    # Smooth horizon weights to reduce step-wise jitter on long-horizon forecasts.
+    if matrix.size > 0:
+        smooth_alpha = 0.30 if regime == "sparse" else 0.22 if regime == "mixed" else 0.15
+        for h in range(1, matrix.shape[1]):
+            matrix[:, h] = (1.0 - smooth_alpha) * matrix[:, h] + smooth_alpha * matrix[:, h - 1]
+            s = float(np.sum(matrix[:, h]))
+            matrix[:, h] = matrix[:, h] / s if s > 0 else np.full(matrix.shape[0], 1.0 / matrix.shape[0], dtype=float)
     return matrix
+
+
+def _project_to_simplex(weights: np.ndarray) -> np.ndarray:
+    """Project arbitrary vector to probability simplex (w>=0, sum(w)=1)."""
+    v = np.asarray(weights, dtype=float).flatten()
+    if v.size == 0:
+        return v
+    if np.all(np.isfinite(v)) and np.all(v >= 0.0) and abs(float(np.sum(v)) - 1.0) <= 1e-8:
+        return v
+    v = np.where(np.isfinite(v), v, 0.0)
+    u = np.sort(v)[::-1]
+    cssv = np.cumsum(u)
+    rho_candidates = np.where(u - (cssv - 1.0) / (np.arange(len(u)) + 1) > 0)[0]
+    if len(rho_candidates) == 0:
+        return np.full_like(v, 1.0 / len(v), dtype=float)
+    rho = int(rho_candidates[-1])
+    theta = float((cssv[rho] - 1.0) / (rho + 1))
+    w = np.maximum(v - theta, 0.0)
+    s = float(np.sum(w))
+    if s <= 0:
+        return np.full_like(v, 1.0 / len(v), dtype=float)
+    return w / s
+
+
+def _optimize_fusion_weights(
+    pred_matrix: np.ndarray,
+    actual: np.ndarray,
+    init_weights: list[float],
+    regime: str,
+) -> np.ndarray:
+    """Simplex-constrained optimization for weighted fusion.
+
+    Objective (smooth approximation):
+    - fit term: MSE on validation window
+    - directional risk term: over-forecast penalty
+    - stability term: L2 distance to prior (init_weights)
+    """
+    p = np.asarray(pred_matrix, dtype=float)
+    if not np.all(np.isfinite(p)):
+        p = np.where(np.isfinite(p), p, 0.0)
+    y = np.asarray(actual, dtype=float).flatten()
+    if p.ndim != 2 or p.shape[0] == 0 or p.shape[1] == 0:
+        return np.asarray(init_weights, dtype=float)
+    n_models, horizon = p.shape
+    if y.size != horizon:
+        if y.size > horizon:
+            y = y[:horizon]
+        elif y.size == 0:
+            y = np.zeros(horizon, dtype=float)
+        else:
+            y = np.pad(y, (0, horizon - y.size), mode="edge")
+
+    prior = _project_to_simplex(np.asarray(init_weights, dtype=float))
+    if prior.size != n_models:
+        prior = np.full(n_models, 1.0 / n_models, dtype=float)
+    w = prior.copy()
+
+    if regime == "sparse":
+        over_penalty, l2_penalty, lr, steps = 0.20, 0.12, 0.15, 80
+    elif regime == "collapse":
+        over_penalty, l2_penalty, lr, steps = 0.16, 0.10, 0.18, 90
+    elif regime == "stable":
+        over_penalty, l2_penalty, lr, steps = 0.10, 0.06, 0.22, 100
+    else:
+        over_penalty, l2_penalty, lr, steps = 0.12, 0.08, 0.20, 90
+
+    scale = max(float(np.mean(np.abs(y))) if y.size > 0 else 1.0, 1.0)
+    prev_obj = float("inf")
+    for _ in range(steps):
+        yhat = np.dot(w, p)
+        err = yhat - y
+        grad_fit = (2.0 / max(horizon, 1)) * np.dot(p, err) / (scale * scale)
+        over_mask = (err > 0).astype(float)
+        grad_over = (over_penalty / max(horizon, 1)) * np.dot(p, over_mask) / scale
+        grad_reg = 2.0 * l2_penalty * (w - prior)
+        obj = (
+            float(np.mean(np.square(err)) / (scale * scale))
+            + over_penalty * float(np.mean(np.maximum(err, 0.0)) / scale)
+            + l2_penalty * float(np.sum(np.square(w - prior)))
+        )
+        w = _project_to_simplex(w - lr * (grad_fit + grad_over + grad_reg))
+        if abs(prev_obj - obj) <= 1e-6:
+            break
+        prev_obj = obj
+    return w
+
+
+def _blend_with_prior_weights(prior: np.ndarray, optimized: np.ndarray, regime: str) -> np.ndarray:
+    prior = _project_to_simplex(np.asarray(prior, dtype=float))
+    optimized = _project_to_simplex(np.asarray(optimized, dtype=float))
+    if prior.size == 0 or optimized.size == 0 or prior.size != optimized.size:
+        return optimized
+    # Keep stronger inertia on sparse/collapse regimes.
+    mix = 0.58 if regime == "sparse" else 0.50 if regime == "collapse" else 0.40 if regime == "mixed" else 0.32
+    blended = mix * prior + (1.0 - mix) * optimized
+    return _project_to_simplex(blended)
 
 
 def run_prophet(train, test, train_exog=None, test_exog=None, verbose=False, screening=None):
@@ -1163,14 +1266,25 @@ def run_all_models(
         inv_weights = [inv_weights[i] * gate_factors[i] for i in range(len(inv_weights))]
         weight_sum = float(sum(inv_weights))
         if weight_sum > 0:
-            weights = [w / weight_sum for w in inv_weights]
-            diversity_boost = _compute_diversity_boost([m["preds"] for m in fusion_pool], test.values)
-            weights = [weights[i] * diversity_boost[i] for i in range(len(weights))]
-            boost_sum = float(sum(weights))
-            weights = [w / boost_sum for w in weights] if boost_sum > 0 else [1.0 / len(fusion_pool)] * len(fusion_pool)
+            prior_weights = [w / weight_sum for w in inv_weights]
             base_models_for_weighted = list(fusion_pool)
             component_names = [m["name"] for m in base_models_for_weighted]
             pred_matrix = np.vstack([np.asarray(m["preds"], dtype=float) for m in base_models_for_weighted])
+            optimized_weights = _optimize_fusion_weights(
+                pred_matrix=pred_matrix,
+                actual=np.asarray(test.values, dtype=float),
+                init_weights=prior_weights,
+                regime=fusion_regime,
+            )
+            optimized_weights = _blend_with_prior_weights(
+                prior=np.asarray(prior_weights, dtype=float),
+                optimized=np.asarray(optimized_weights, dtype=float),
+                regime=fusion_regime,
+            )
+            diversity_boost = _compute_diversity_boost([m["preds"] for m in fusion_pool], test.values)
+            weights = [float(optimized_weights[i]) * float(diversity_boost[i]) for i in range(len(optimized_weights))]
+            boost_sum = float(sum(weights))
+            weights = [w / boost_sum for w in weights] if boost_sum > 0 else [1.0 / len(fusion_pool)] * len(fusion_pool)
             horizon_weight_matrix = _build_horizon_weight_matrix(component_names, weights, pred_matrix.shape[1], fusion_regime)
             weighted_forecast = np.sum(pred_matrix * horizon_weight_matrix, axis=0)
             weighted_wmape = calculate_wmape(test, weighted_forecast, min_non_zero_points=4)

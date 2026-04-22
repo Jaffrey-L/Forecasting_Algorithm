@@ -242,3 +242,15 @@ class TestCoreFunctions:
         assert isinstance(accuracy, dict)
         assert 'wmape' in accuracy
         assert 'sku_metrics' in accuracy
+
+    def test_blend_with_prior_weights_keeps_simplex_and_inertia(self):
+        from src.forecasting.predictors import _blend_with_prior_weights
+
+        prior = np.array([0.7, 0.2, 0.1], dtype=float)
+        optimized = np.array([0.1, 0.8, 0.1], dtype=float)
+        blended = _blend_with_prior_weights(prior, optimized, regime="sparse")
+
+        assert np.isclose(blended.sum(), 1.0)
+        assert np.all(blended >= 0)
+        # Sparse regime should keep stronger inertia to prior than raw optimized.
+        assert blended[0] > optimized[0]

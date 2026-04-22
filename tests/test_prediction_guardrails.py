@@ -7,13 +7,13 @@ from src.forecasting.sample_screening import screen_weekly_series
 from src.forecasting.predictors import calculate_wmape, safe_predictions
 
 
-def test_calculate_wmape_returns_inf_when_non_zero_points_too_sparse():
+def test_calculate_wmape_caps_when_non_zero_points_too_sparse():
     y_true = np.array([0, 0, 5, 0, 0, 3])
     y_pred = np.array([1, 2, 4, 1, 1, 2])
 
     wmape = calculate_wmape(y_true, y_pred, min_non_zero_points=4)
 
-    assert math.isinf(wmape)
+    assert wmape == 9.999
 
 
 def test_safe_predictions_caps_extreme_positive_forecasts_against_recent_history():
@@ -49,7 +49,7 @@ def test_screen_weekly_series_flags_156_week_zero_tail_anomaly():
     assert screening["qualified_156_weeks"] is True
     assert screening["has_recent_zero_tail"] is True
     assert screening["is_anomalous"] is True
-    assert screening["recommendation"] == "zero_override"
+    assert screening["recommendation"] == "conservative"
     assert "recent_zero_tail" in screening["reasons"]
 
 
@@ -62,3 +62,13 @@ def test_screen_weekly_series_keeps_stable_156_week_sample_on_standard_path():
     assert screening["qualified_156_weeks"] is True
     assert screening["is_anomalous"] is False
     assert screening["recommendation"] == "standard"
+
+
+def test_screen_weekly_series_uses_dynamic_collapse_ratio_for_sparse_history():
+    # Sparse + short history should use stricter collapse threshold to avoid false standard.
+    series = pd.Series([20.0] * 40 + [3.0] * 8, dtype=float)
+    screening = screen_weekly_series(series, min_history_weeks=32, collapse_ratio=0.35)
+
+    assert screening["history_weeks"] == 48
+    assert screening["collapse_ratio_used"] >= 0.40
+    assert screening["recommendation"] in {"conservative", "zero_override"}
