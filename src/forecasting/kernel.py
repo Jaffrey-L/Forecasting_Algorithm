@@ -38,6 +38,49 @@ from src.forecasting.runtime_facade import (
     calculate_principal_dynamic_shares,
 )
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return int(max(minimum, min(value, maximum)))
+
+
+def _clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return float(max(minimum, min(value, maximum)))
+
+
+SCOPE_MIN_HISTORY_WEEKS = max(_env_int("SCOPE_MIN_WEEKS", 108), 12)
+MAX_TRAIN_HISTORY_WEEKS = max(_env_int("MAX_TRAIN_HISTORY_WEEKS", 156), 12)
+VALIDATION_TEST_MIN_WEEKS = max(_env_int("VALIDATION_TEST_MIN_WEEKS", 8), 4)
+VALIDATION_TEST_MAX_WEEKS = max(_env_int("VALIDATION_TEST_MAX_WEEKS", 16), VALIDATION_TEST_MIN_WEEKS)
+VALIDATION_TEST_DIVISOR = max(_env_int("VALIDATION_TEST_DIVISOR", 4), 2)
+
+CONSERVATIVE_NON_ZERO_MAX = _clamp_int(_env_int("CONSERVATIVE_NON_ZERO_MAX", 4), 1, 16)
+CONSERVATIVE_TOTAL_SALES_MIN = max(_env_float("CONSERVATIVE_TOTAL_SALES_MIN", 60.0), 0.0)
+CONSERVATIVE_ZERO_RATIO_MIN = _clamp_float(_env_float("CONSERVATIVE_ZERO_RATIO_MIN", 0.70), 0.0, 1.0)
+CONSERVATIVE_RECENT_RATIO_MAX = _clamp_float(_env_float("CONSERVATIVE_RECENT_RATIO_MAX", 0.20), 0.0, 1.0)
+
+LOW_SIGNAL_NON_ZERO_MAX = _clamp_int(_env_int("LOW_SIGNAL_NON_ZERO_MAX", 6), 1, 20)
+LOW_SIGNAL_TOTAL_SALES_MIN = max(_env_float("LOW_SIGNAL_TOTAL_SALES_MIN", 120.0), 0.0)
+LOW_SIGNAL_NON_ZERO_MAX = max(LOW_SIGNAL_NON_ZERO_MAX, CONSERVATIVE_NON_ZERO_MAX)
+
+NEAR_TIE_ENSEMBLE_MARGIN = _clamp_float(_env_float("NEAR_TIE_ENSEMBLE_MARGIN", 0.012), 0.004, 0.03)
+DUAL_GUARD_WMAPE_MARGIN_STANDARD = _clamp_float(_env_float("DUAL_GUARD_WMAPE_MARGIN_STANDARD", 0.015), 0.005, 0.03)
+DUAL_GUARD_WMAPE_MARGIN_LOW_SIGNAL = _clamp_float(_env_float("DUAL_GUARD_WMAPE_MARGIN_LOW_SIGNAL", 0.02), 0.005, 0.05)
+DUAL_GUARD_QUALITY_MARGIN_STANDARD = _clamp_float(_env_float("DUAL_GUARD_QUALITY_MARGIN_STANDARD", 0.05), 0.01, 0.2)
+DUAL_GUARD_QUALITY_MARGIN_LOW_SIGNAL = _clamp_float(_env_float("DUAL_GUARD_QUALITY_MARGIN_LOW_SIGNAL", 0.08), 0.02, 0.3)
+
 
 @lru_cache(maxsize=1)
 def _load_legacy_kernel() -> ModuleType:
@@ -424,6 +467,91 @@ def _zero_validation_proxy_error(preds: np.ndarray, train_series: pd.Series) -> 
     return float(min(mae / anchor, 9.999))
 
 
+def _candidate_quality_metric(candidate: dict) -> float:
+    quality = float(candidate.get("quality_score", float(candidate.get("wmape", float("inf")))))
+    if not np.isfinite(quality):
+        return float("inf")
+    return quality
+
+
+def _prefer_stable_ensemble_near_tie(
+    winner: dict,
+    finalists: list[dict],
+    screening: dict,
+    validation_non_zero_points: int,
+    low_signal_window: bool,
+) -> tuple[dict, str | None]:
+    if str(winner.get("name", "")).startswith("Ensemble"):
+        return winner, None
+    ensemble_candidate = _best_ensemble_candidate(finalists)
+    if ensemble_candidate is None:
+        return winner, None
+    winner_wmape = float(winner.get("wmape", float("inf")))
+    ensemble_wmape = float(ensemble_candidate.get("wmape", float("inf")))
+    if not (np.isfinite(winner_wmape) and np.isfinite(ensemble_wmape)):
+        return winner, None
+    zero_ratio = float(screening.get("zero_ratio", 1.0))
+    recent_mean = float(screening.get("recent_mean", 0.0))
+    if validation_non_zero_points < 6 or zero_ratio > 0.60 or recent_mean <= 0.5:
+        return winner, None
+    tie_margin = NEAR_TIE_ENSEMBLE_MARGIN + (0.003 if low_signal_window else 0.0)
+    if ensemble_wmape > winner_wmape + tie_margin:
+        return winner, None
+    winner_quality = _candidate_quality_metric(winner)
+    ensemble_quality = _candidate_quality_metric(ensemble_candidate)
+    if ensemble_quality <= winner_quality + 0.02:
+        reason = (
+            "near-tie stable ensemble fallback: "
+            f"{ensemble_candidate.get('name')} wmape={ensemble_wmape:.4f}, "
+            f"quality={ensemble_quality:.4f} vs winner {winner.get('name')} "
+            f"wmape={winner_wmape:.4f}, quality={winner_quality:.4f}"
+        )
+        return ensemble_candidate, reason
+    return winner, None
+
+
+def _apply_dual_metric_guardrail(
+    winner: dict,
+    finalists: list[dict],
+    low_signal_window: bool,
+) -> tuple[dict, str | None]:
+    finite_finalists = [
+        candidate for candidate in finalists if np.isfinite(float(candidate.get("wmape", float("inf"))))
+    ]
+    if not finite_finalists:
+        return winner, None
+    best_wmape = min(float(candidate.get("wmape", float("inf"))) for candidate in finite_finalists)
+    best_quality = min(_candidate_quality_metric(candidate) for candidate in finite_finalists)
+    wmape_margin = DUAL_GUARD_WMAPE_MARGIN_LOW_SIGNAL if low_signal_window else DUAL_GUARD_WMAPE_MARGIN_STANDARD
+    quality_margin = DUAL_GUARD_QUALITY_MARGIN_LOW_SIGNAL if low_signal_window else DUAL_GUARD_QUALITY_MARGIN_STANDARD
+    dual_pass = [
+        candidate
+        for candidate in finite_finalists
+        if float(candidate.get("wmape", float("inf"))) <= best_wmape + wmape_margin
+        and _candidate_quality_metric(candidate) <= best_quality + quality_margin
+    ]
+    if not dual_pass:
+        return winner, None
+    winner_name = str(winner.get("name", ""))
+    if any(str(candidate.get("name", "")) == winner_name for candidate in dual_pass):
+        return winner, None
+    replacement = min(
+        dual_pass,
+        key=lambda candidate: (
+            float(candidate.get("wmape", float("inf"))),
+            _candidate_quality_metric(candidate),
+            _low_signal_model_priority(candidate.get("name", "")),
+        ),
+    )
+    reason = (
+        "dual-metric guardrail: "
+        f"use {replacement.get('name')} (wmape={float(replacement.get('wmape', float('inf'))):.4f}, "
+        f"quality={_candidate_quality_metric(replacement):.4f}) instead of {winner_name} "
+        f"(wmape={float(winner.get('wmape', float('inf'))):.4f}, quality={_candidate_quality_metric(winner):.4f})"
+    )
+    return replacement, reason
+
+
 def _conservative_shortlist(valid_results: list[dict], wmape_margin: float = 0.015) -> list[dict]:
     finite_candidates = [
         candidate
@@ -516,15 +644,15 @@ def process_single_spu(
                 exog_series = exog_df[exog_df.index < current_week_end]
                 has_exog, used_exog = True, available
 
-        if len(series) > 156:
-            series = series.iloc[-156:]
-            original_series = original_series.iloc[-156:]
+        if len(series) > MAX_TRAIN_HISTORY_WEEKS:
+            series = series.iloc[-MAX_TRAIN_HISTORY_WEEKS:]
+            original_series = original_series.iloc[-MAX_TRAIN_HISTORY_WEEKS:]
             if has_exog and exog_series is not None:
-                exog_series = exog_series.iloc[-156:]
+                exog_series = exog_series.iloc[-MAX_TRAIN_HISTORY_WEEKS:]
         if has_exog and exog_series is not None:
             exog_series = exog_series.reindex(series.index).ffill().bfill().fillna(0)
 
-        screening = screen_weekly_series(series)
+        screening = screen_weekly_series(series, min_history_weeks=SCOPE_MIN_HISTORY_WEEKS)
         if screening["insufficient_data"]:
             return None, f"数据不足 ({screening['history_weeks']}周)", None, None
 
@@ -541,7 +669,7 @@ def process_single_spu(
         if verbose:
             profiler.print_profile(profile)
 
-        test_len = min(16, max(8, len(series_clean) // 4))
+        test_len = min(VALIDATION_TEST_MAX_WEEKS, max(VALIDATION_TEST_MIN_WEEKS, len(series_clean) // VALIDATION_TEST_DIVISOR))
         train, test = series_clean.iloc[:-test_len], series_clean.iloc[-test_len:]
         train_exog = exog_series.iloc[:-test_len] if has_exog else None
         test_exog = exog_series.iloc[-test_len:] if has_exog else None
@@ -565,14 +693,14 @@ def process_single_spu(
         # - standard with low-signal guard: for moderate sparse windows, keep full model arena
         extreme_low_signal = (
             recommendation == "zero_override"
-            or validation_non_zero_points < 4
-            or validation_total_sales < 60
-            or zero_ratio >= 0.70
-            or recent_to_prior_ratio <= 0.20
+            or validation_non_zero_points < CONSERVATIVE_NON_ZERO_MAX
+            or validation_total_sales < CONSERVATIVE_TOTAL_SALES_MIN
+            or zero_ratio >= CONSERVATIVE_ZERO_RATIO_MIN
+            or recent_to_prior_ratio <= CONSERVATIVE_RECENT_RATIO_MAX
         )
         low_signal_window = (
-            validation_non_zero_points < 6
-            or validation_total_sales < 120
+            validation_non_zero_points < LOW_SIGNAL_NON_ZERO_MAX
+            or validation_total_sales < LOW_SIGNAL_TOTAL_SALES_MIN
             or recommendation in {"conservative", "zero_override"}
         )
         baseline_conservative = (
@@ -738,6 +866,22 @@ def process_single_spu(
                                 f"choose {winner['name']} ({ensemble_wmape:.4f}) "
                                 f"over conservative winner ({winner_wmape:.4f})."
                             )
+                winner, near_tie_reason = _prefer_stable_ensemble_near_tie(
+                    winner=winner,
+                    finalists=finalists,
+                    screening=screening,
+                    validation_non_zero_points=validation_non_zero_points,
+                    low_signal_window=low_signal_window,
+                )
+                if near_tie_reason and log_fn is not None:
+                    log_fn(f"SPU {spu} {near_tie_reason}.")
+                winner, dual_reason = _apply_dual_metric_guardrail(
+                    winner=winner,
+                    finalists=finalists,
+                    low_signal_window=low_signal_window,
+                )
+                if dual_reason and log_fn is not None:
+                    log_fn(f"SPU {spu} {dual_reason}.")
 
                 # Zero-validation-window fallback:
                 # when all validation points are zero, regular WMAPE is not informative.
@@ -780,9 +924,25 @@ def process_single_spu(
                     key=lambda item: item[0],
                 )
                 winner = ranked[0][1]
+                winner, near_tie_reason = _prefer_stable_ensemble_near_tie(
+                    winner=winner,
+                    finalists=finalists,
+                    screening=screening,
+                    validation_non_zero_points=validation_non_zero_points,
+                    low_signal_window=low_signal_window,
+                )
+                winner, dual_reason = _apply_dual_metric_guardrail(
+                    winner=winner,
+                    finalists=finalists,
+                    low_signal_window=low_signal_window,
+                )
                 if log_fn is not None:
                     score_text = ", ".join([f"{item[1]['name']}={item[0]:.4f}" for item in ranked[:4]])
                     log_fn(f"SPU {spu} standard final ranking: {score_text}.")
+                    if near_tie_reason:
+                        log_fn(f"SPU {spu} {near_tie_reason}.")
+                    if dual_reason:
+                        log_fn(f"SPU {spu} {dual_reason}.")
 
         future_exog = None
         if has_exog and exog_series is not None:

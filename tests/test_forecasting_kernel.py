@@ -36,7 +36,18 @@ def test_kernel_process_single_spu_is_local(monkeypatch):
         def print_forecast_summary(self, profile, future_dates, forecast_values):
             return None
 
-    def fake_run_all_models(train, test, mode="smart", train_exog=None, test_exog=None, verbose=False, log_fn=None):
+    def fake_run_all_models(
+        train,
+        test,
+        mode="smart",
+        train_exog=None,
+        test_exog=None,
+        verbose=False,
+        log_fn=None,
+        screening=None,
+        model_policy=None,
+        **kwargs,
+    ):
         return (
             [
                 {
@@ -204,6 +215,11 @@ def test_kernel_skips_sparse_validation_windows(monkeypatch):
         def analyze(self, spu, series, original_series, exog_series):
             return SimpleNamespace(spu=spu)
 
+        def update_with_results(self, profile, train, test, all_results, winner, forecast_values, total_time):
+            profile.winner_algo = winner["name"]
+            profile.winner_wmape = winner["wmape"]
+            return profile
+
     monkeypatch.setattr(kernel, "SPUProfiler", DummyProfiler)
     monkeypatch.setattr(kernel, "clean_series", lambda series: series)
     monkeypatch.setattr(kernel, "get_current_week_end", lambda: pd.Timestamp("2025-06-01"))
@@ -227,7 +243,50 @@ def test_kernel_skips_sparse_validation_windows(monkeypatch):
         verbose=False,
     )
 
-    assert result_df is None
-    assert message == "验证窗口非零样本不足，已跳过标准预测链"
+    assert result_df is not None
+    assert "policy=conservative" in message
     assert viz is None
-    assert profile is None
+    assert profile is not None
+
+
+def test_kernel_near_tie_prefers_stable_ensemble():
+    import src.forecasting.kernel as kernel
+
+    winner = {"name": "LowSignalMedian", "wmape": 0.3000, "quality_score": 0.2600}
+    finalists = [
+        winner,
+        {"name": "Ensemble-Weighted", "wmape": 0.3090, "quality_score": 0.2400},
+        {"name": "AutoARIMA", "wmape": 0.3350, "quality_score": 0.2500},
+    ]
+    screening = {"zero_ratio": 0.35, "recent_mean": 5.0}
+
+    chosen, reason = kernel._prefer_stable_ensemble_near_tie(
+        winner=winner,
+        finalists=finalists,
+        screening=screening,
+        validation_non_zero_points=10,
+        low_signal_window=False,
+    )
+
+    assert chosen["name"] == "Ensemble-Weighted"
+    assert reason is not None
+
+
+def test_kernel_dual_metric_guardrail_replaces_unbalanced_winner():
+    import src.forecasting.kernel as kernel
+
+    winner = {"name": "LowSignalMedian", "wmape": 0.3020, "quality_score": 0.4200}
+    finalists = [
+        winner,
+        {"name": "Ensemble-Weighted", "wmape": 0.3080, "quality_score": 0.2100},
+        {"name": "AutoARIMA", "wmape": 0.3350, "quality_score": 0.2600},
+    ]
+
+    chosen, reason = kernel._apply_dual_metric_guardrail(
+        winner=winner,
+        finalists=finalists,
+        low_signal_window=False,
+    )
+
+    assert chosen["name"] == "Ensemble-Weighted"
+    assert reason is not None
